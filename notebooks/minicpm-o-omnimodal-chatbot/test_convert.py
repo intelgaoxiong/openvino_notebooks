@@ -17,15 +17,16 @@ import openvino as ov
 
 from minicpm_o_helper import llm_path, copy_llm_files
 
+from nncf import BackupMode
 
-compression_configuration = {"mode": nncf.CompressWeightsMode.INT4_SYM, "group_size": 128, "ratio": 1.0, "all_layers": True}
-
+#compression_configuration = {"mode": nncf.CompressWeightsMode.INT4_SYM, "group_size": 128, "ratio": 1.0, "all_layers": True}
+compression_configuration = {"mode": nncf.CompressWeightsMode.INT4_SYM, "group_size": 128, "ratio": 1.0}
 
 core = ov.Core()
 llm_int4_path = Path("language_model_int4") / llm_path.name
 if to_compress_weights.value and not (model_dir / llm_int4_path).exists():
     ov_model = core.read_model(model_dir / llm_path)
-    ov_compressed_model = nncf.compress_weights(ov_model, **compression_configuration)
+    ov_compressed_model = nncf.compress_weights(ov_model, backup_mode=BackupMode.NONE, **compression_configuration)
     ov.save_model(ov_compressed_model, model_dir / llm_int4_path)
     del ov_compressed_model
     del ov_model
