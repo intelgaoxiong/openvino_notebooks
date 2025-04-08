@@ -1052,7 +1052,9 @@ class OvMiniCPMO:
                 for i in range(B):
                     patch_attn_mask[i, 0, : tgt_sizes[i][0] * tgt_sizes[i][1]] = True
 
-                vision_batch_size = 32
+                # vision_batch_size = 32
+                # For NPU
+                vision_batch_size = 1
                 all_pixel_values = all_pixel_values
                 if B > vision_batch_size:
                     hs = []
@@ -1658,6 +1660,39 @@ class OvMiniCPMO:
 
             return answer
 
+def convert_to_static_shape(model, patch_size):
+    batch_size = 1
+    patch_len = 1036
+
+    shapes = {}
+
+    for input in model.inputs:
+        input_shape = input.partial_shape
+        input_name = input.any_name
+
+        if input_name.startswith("pixel_values"):
+            input_shape[0] = batch_size
+            input_shape[1] = 3
+            input_shape[2] = patch_size
+            input_shape[3] = patch_size * patch_len
+        elif input_name.startswith("patch_attention_mask"):
+            input_shape[0] = batch_size
+            input_shape[1] = 1
+            input_shape[2] = patch_len
+        #elif input_name.startswith("position_ids"):
+        else:
+            input_shape[0] = batch_size
+            input_shape[1] = patch_len
+
+        shapes[input] = input_shape
+
+        print(f"input_name: {input_name}")
+        print(f"input_shape: {shapes[input]}")
+
+    # Reshape the model
+    model.reshape(shapes)
+
+    return model
 
 def init_model(model_dir, llm_model_dir, device):
     config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
@@ -1665,10 +1700,13 @@ def init_model(model_dir, llm_model_dir, device):
     embedder_device = device
     if m_is_npu:
         embedder_device = "CPU"
-    llm = OvModelForCausalLMWithEmb(model_dir / llm_model_dir, device)
-    print("Start to compile img emb")
-    img_emb = core.compile_model(model_dir / image_emb_path, embedder_device)
+    img_emb_model = core.read_model(model_dir / image_emb_path)
+    img_emb_model = convert_to_static_shape(img_emb_model, config.vision_config.patch_size)
+    ov.serialize(img_emb_model, "vit.xml")
+    print("Start to compile img emb, patch size:", config.vision_config.patch_size)
+    img_emb = core.compile_model(img_emb_model, device)
     print("Compile img emb done")
+    llm = OvModelForCausalLMWithEmb(model_dir / llm_model_dir, device)
     aud_emb = core.compile_model(model_dir / audio_emb_path, embedder_device)
     resampler = core.compile_model(model_dir / resampler_path, embedder_device)
     processor = AutoProcessor.from_pretrained(model_dir, trust_remote_code=True)
