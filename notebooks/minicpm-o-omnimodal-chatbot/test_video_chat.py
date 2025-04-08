@@ -60,12 +60,20 @@ ov_model.chat(
 )
 
 # Chat
-answer = ov_model.chat(
+answer_generator = ov_model.chat(
     msgs=msgs,
+    stream=True,
     tokenizer=tokenizer,
     **params
 )
-print(answer)
+
+# Iterate over the generator to process each piece of data
+for partial_answer in answer_generator:
+    # Print each piece of data without a newline
+    print(partial_answer, end='', flush=True)
+
+# Optionally, print a newline at the end to ensure the prompt returns to the next line
+print()
 
 import numpy as np
 
@@ -75,7 +83,7 @@ def calc_mean_and_std(durations):
     
     # Convert durations to milliseconds
     durations_ms = np.array(durations) * 1000.0
-    
+
     # Calculate mean
     mean = np.mean(durations_ms)
 
@@ -88,6 +96,7 @@ durations = ov_model.llm.llm_times[1:]
 tpot_mean, tpot_std = calc_mean_and_std(durations)
 throughput_mean, throughput_std = [1000.0 / tpot_mean, (tpot_std * 1000.0) / (tpot_mean * tpot_mean)]
 ttft_mean, ttft_std = calc_mean_and_std([ov_model.llm.llm_times[0]])
+print(f"LLM compilation time: {ov_model.llm.llm_compilation_time} s")
 print(f"TTFT: {ttft_mean} ± {ttft_std} ms/token")
 print(f"TPOT: {tpot_mean} ± {tpot_std} ms/token")
 print(f"Throughput: {throughput_mean} ± {throughput_std} tokens/s")

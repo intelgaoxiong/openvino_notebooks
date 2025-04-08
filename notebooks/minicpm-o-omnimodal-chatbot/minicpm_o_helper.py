@@ -734,6 +734,7 @@ class OvModelForCausalLMWithEmb(GenerationMixin):
             print("LLM compile on device: ", self._device)
             #self.request = core.compile_model(self.model, self._device, self.ov_config).create_infer_request()
 
+            start = time.perf_counter()
             kv_desc = KVDesc(max_prompt_len=1024, min_response_len=128)
             kv_pos = KVAxesPosition(batch=0, seq_len=2)
             copy_config = self.ov_config
@@ -741,6 +742,7 @@ class OvModelForCausalLMWithEmb(GenerationMixin):
                 copy_config = {}
             update_npu_config(copy_config, self.model, kv_pos, kv_desc)
             self.request = core.compile_model(self.model, self._device, copy_config).create_infer_request()
+            self.llm_compilation_time = time.perf_counter() - start
         self._compile_token_emb()
 
     def _compile_token_emb(self):
@@ -797,7 +799,7 @@ class OvModelForCausalLMWithEmb(GenerationMixin):
                 inputs_embeds = inputs_embeds * self.config.scale_emb
         inputs["inputs_embeds"] = inputs_embeds
         shape = inputs["inputs_embeds"].shape
-        print("inputs_embeds shape:", shape)
+        # print("inputs_embeds shape:", shape)
 
         # Add the attention_mask inputs when needed
         if "attention_mask" in self.input_names or "position_ids" in self.input_names:
@@ -847,10 +849,10 @@ class OvModelForCausalLMWithEmb(GenerationMixin):
 
         start = time.perf_counter()
         # Run inference
-        print("LLM start async")
+        # print("LLM start async")
         self.request.start_async(inputs, share_inputs=True)
         self.request.wait()
-        print("LLM infer done")
+        # print("LLM infer done")
         self.llm_times.append(time.perf_counter() - start)
         logits = self.request.get_tensor("logits").data
         logits = torch.from_numpy(logits).to(self.device)
