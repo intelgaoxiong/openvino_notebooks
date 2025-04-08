@@ -16,7 +16,11 @@ use_int4_lang_model = lm_variant_selector(model_dir / llm_int4_path)
 
 use_int4_lang_model
 
-ov_model = init_model(model_dir, llm_path.parent if not use_int4_lang_model.value else llm_int4_path.parent, device.value)
+print("use_int4_lang_model:", use_int4_lang_model.value)
+
+print("device:", device.value)
+
+ov_model = init_model(model_dir, llm_int4_path.parent, "NPU")
 tokenizer = ov_model.processor.tokenizer
 
 import math

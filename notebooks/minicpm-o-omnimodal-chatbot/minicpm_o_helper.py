@@ -55,7 +55,6 @@ class InsertSlice(MatcherPass):
                 self.model_changed = True
                 # Use new operation for additional matching
                 self.register_new_node(slice)
-                print("applied slice for lm head")
 
                 return True
 
@@ -660,6 +659,45 @@ def prepare_vis_position_ids(pixel_values, patch_attention_mask, tgt_sizes, patc
 core = ov.Core()
 
 
+def update_config(config, pair):
+    if pair[0] not in config:
+        config[pair[0]] = pair[1]
+
+def rename_key(config, old_key, new_key):
+    if old_key in config:
+        opt_value = config.pop(old_key)
+        config[new_key] = opt_value
+
+class KVAxesPosition:
+    def __init__(self, batch: int, seq_len: int):
+        self.batch = batch
+        self.seq_len = seq_len
+
+class KVDesc:
+    def __init__(self, max_prompt_len: int, min_response_len: int):
+        self.max_prompt_len = max_prompt_len
+        self.min_response_len = min_response_len
+
+def update_npu_config(config, model, kv_pos, kv_desc):
+    update_config(config, ("NPU_USE_NPUW", "YES"))
+    update_config(config, ("NPUW_LLM", "YES"))
+
+    update_config(config, ("NPUW_LLM_BATCH_DIM", kv_pos.batch))
+    update_config(config, ("NPUW_LLM_SEQ_LEN_DIM", kv_pos.seq_len))
+
+    update_config(config, ("NPUW_LLM_MAX_PROMPT_LEN", kv_desc.max_prompt_len))
+    update_config(config, ("NPUW_LLM_MIN_RESPONSE_LEN", kv_desc.min_response_len))
+
+    # update_config(config, ("NPUW_DUMP_SUBS", "YES"))
+    update_config(config, ("NPU_COMPILER_DYNAMIC_QUANTIZATION", "YES"))
+
+    rename_key(config, "++PREFILL_CONFIG", "++NPUW_LLM_PREFILL_CONFIG")
+    rename_key(config, "++GENERATE_CONFIG", "++NPUW_LLM_GENERATE_CONFIG")
+    rename_key(config, "PREFILL_CONFIG", "NPUW_LLM_PREFILL_CONFIG")
+    rename_key(config, "PREFILL_HINT", "NPUW_LLM_PREFILL_HINT")
+    rename_key(config, "GENERATE_CONFIG", "NPUW_LLM_GENERATE_CONFIG")
+    rename_key(config, "GENERATE_HINT", "NPUW_LLM_GENERATE_HINT")
+
 class OvModelForCausalLMWithEmb(GenerationMixin):
     def __init__(self, model_dir, device="CPU", ov_config=None, compile=True, slice_lm_head=True) -> None:
         self._supports_cache_class = False
@@ -693,12 +731,22 @@ class OvModelForCausalLMWithEmb(GenerationMixin):
 
     def compile(self):
         if self.request is None:
-            self.request = core.compile_model(self.model, self._device, self.ov_config).create_infer_request()
+            print("LLM compile on device: ", self._device)
+            #self.request = core.compile_model(self.model, self._device, self.ov_config).create_infer_request()
+
+            kv_desc = KVDesc(max_prompt_len=1024, min_response_len=128)
+            kv_pos = KVAxesPosition(batch=0, seq_len=2)
+            copy_config = self.ov_config
+            if copy_config is None:
+                copy_config = {}
+            update_npu_config(copy_config, self.model, kv_pos, kv_desc)
+            self.request = core.compile_model(self.model, self._device, copy_config).create_infer_request()
         self._compile_token_emb()
 
     def _compile_token_emb(self):
         if self.token_emb_request is None:
-            self.token_emb_request = core.compile_model(self.token_emb, self._device, self.ov_config)
+            print("Compile token embedding for LLM")
+            self.token_emb_request = core.compile_model(self.token_emb, "CPU", self.ov_config)
 
     def to(self, device: str):
         if isinstance(device, str):
@@ -748,6 +796,8 @@ class OvModelForCausalLMWithEmb(GenerationMixin):
             if hasattr(self.config, "scale_emb"):
                 inputs_embeds = inputs_embeds * self.config.scale_emb
         inputs["inputs_embeds"] = inputs_embeds
+        shape = inputs["inputs_embeds"].shape
+        print("inputs_embeds shape:", shape)
 
         # Add the attention_mask inputs when needed
         if "attention_mask" in self.input_names or "position_ids" in self.input_names:
@@ -797,8 +847,10 @@ class OvModelForCausalLMWithEmb(GenerationMixin):
 
         start = time.perf_counter()
         # Run inference
+        print("LLM start async")
         self.request.start_async(inputs, share_inputs=True)
         self.request.wait()
+        print("LLM infer done")
         self.llm_times.append(time.perf_counter() - start)
         logits = self.request.get_tensor("logits").data
         logits = torch.from_numpy(logits).to(self.device)
@@ -1034,6 +1086,7 @@ class OvMiniCPMO:
                     vision_embedding = torch.from_numpy(self.vpm([all_pixel_values, patch_attn_mask, position_ids])[0])
                     self.vpm_times.append(time.perf_counter() - start)
                 vision_embedding = self.resampler(vision_embedding, tgt_sizes)
+                print("vision_embedding shape after resampler:", vision_embedding.shape)
 
                 start = 0
                 for pixel_values in pixel_values_list:
@@ -1199,6 +1252,7 @@ class OvMiniCPMO:
             if key in kwargs:
                 del kwargs[key]
 
+        print("vllm embedding shape: ", vllm_embedding.shape)
         return self.llm(input_ids=None, position_ids=position_ids, inputs_embeds=vllm_embedding, **kwargs)
 
     def _decode(self, inputs_embeds, tokenizer, attention_mask, decode_text=False, **kwargs):
@@ -1360,12 +1414,19 @@ class OvMiniCPMO:
 
         model_output = {}
         with torch.inference_mode():
+            print("get_vllm_embedding")
             model_inputs["inputs_embeds"], vision_hidden_states = self.get_vllm_embedding(model_inputs)
+            print("get_vllm_embedding done")
+            shape = model_inputs["inputs_embeds"].shape
+            print("get_vllm_embedding shape:", shape)
             model_inputs["inputs_embeds"] = self.get_omni_embedding(
                 model_inputs,
                 input_embeddings=model_inputs["inputs_embeds"],
                 chunk_length=self.config.audio_chunk_length,
             )
+            print("get_omni_embedding done")
+            shape = model_inputs["inputs_embeds"].shape
+            print("get_omni_embedding shape:", shape)
 
             if stream:
                 result = self._decode_stream(model_inputs["inputs_embeds"], tokenizer, **kwargs)
@@ -1600,10 +1661,16 @@ class OvMiniCPMO:
 
 def init_model(model_dir, llm_model_dir, device):
     config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
+    m_is_npu = device == "NPU"
+    embedder_device = device
+    if m_is_npu:
+        embedder_device = "CPU"
     llm = OvModelForCausalLMWithEmb(model_dir / llm_model_dir, device)
-    img_emb = core.compile_model(model_dir / image_emb_path, device)
-    aud_emb = core.compile_model(model_dir / audio_emb_path, device)
-    resampler = core.compile_model(model_dir / resampler_path, device)
+    print("Start to compile img emb")
+    img_emb = core.compile_model(model_dir / image_emb_path, embedder_device)
+    print("Compile img emb done")
+    aud_emb = core.compile_model(model_dir / audio_emb_path, embedder_device)
+    resampler = core.compile_model(model_dir / resampler_path, embedder_device)
     processor = AutoProcessor.from_pretrained(model_dir, trust_remote_code=True)
 
     ov_model = OvMiniCPMO(config, img_emb, resampler, aud_emb, llm, processor)
