@@ -367,7 +367,7 @@ def convert_vision_encoder(model, model_dir):
         def siglip_vis_embed_forward(
             self,
             pixel_values: torch.FloatTensor,
-            patch_attention_mask: torch.BoolTensor,
+            patch_attention_mask: torch.FloatTensor,
             tgt_sizes: Optional[torch.IntTensor] = None,
             position_ids: Optional[torch.FloatTensor] = None,
         ) -> torch.Tensor:
@@ -387,7 +387,8 @@ def convert_vision_encoder(model, model_dir):
                     fill_value=0,
                 )
 
-                for batch_idx, p_attn_mask in enumerate(patch_attention_mask):
+                patch_attention_mask_bool = patch_attention_mask.bool()
+                for batch_idx, p_attn_mask in enumerate(patch_attention_mask_bool):
                     if tgt_sizes is not None:
                         nb_patches_h = tgt_sizes[batch_idx][0]
                         nb_patches_w = tgt_sizes[batch_idx][1]
@@ -441,7 +442,7 @@ def convert_vision_encoder(model, model_dir):
         def siglip_transformer_forward(
             self,
             pixel_values,
-            patch_attention_mask: Optional[torch.BoolTensor] = None,
+            patch_attention_mask: Optional[torch.FloatTensor] = None,
             tgt_sizes: Optional[torch.IntTensor] = None,
             position_ids: Optional[torch.FloatTensor] = None,
             output_attentions: Optional[bool] = None,
@@ -454,7 +455,7 @@ def convert_vision_encoder(model, model_dir):
 
             batch_size = pixel_values.size(0)
             if patch_attention_mask is None:
-                patch_attention_mask = torch.ones(
+                patch_attention_mask_bool = torch.ones(
                     size=(
                         batch_size,
                         pixel_values.size(2) // self.config.patch_size,
@@ -463,13 +464,16 @@ def convert_vision_encoder(model, model_dir):
                     dtype=torch.bool,
                     device=pixel_values.device,
                 )
+                patch_attention_mask = patch_attention_mask_bool.float()
+            else:
+                patch_attention_mask_bool = patch_attention_mask.bool()
 
             hidden_states = self.embeddings(
                 pixel_values=pixel_values, patch_attention_mask=patch_attention_mask, tgt_sizes=tgt_sizes, position_ids=position_ids
             )
 
-            patch_attention_mask = patch_attention_mask.view(batch_size, -1)
-            attention_mask = _prepare_4d_attention_mask(patch_attention_mask, hidden_states.dtype) if not self._use_flash_attention_2 else patch_attention_mask
+            patch_attention_mask_bool = patch_attention_mask_bool.view(batch_size, -1)
+            attention_mask = _prepare_4d_attention_mask(patch_attention_mask_bool, hidden_states.dtype) if not self._use_flash_attention_2 else patch_attention_mask_bool
 
             encoder_outputs = self.encoder(
                 inputs_embeds=hidden_states,
@@ -501,10 +505,11 @@ def convert_vision_encoder(model, model_dir):
         pixel_values = torch.randn([1, 3, 14, 14448])
         patch_attn_mask = torch.zeros((1, 1, 1032), dtype=torch.bool)
         patch_attn_mask[0, 0, : tgt_sizes[0][0] * tgt_sizes[0][1]] = True
+        patch_attn_mask_float = patch_attn_mask.float()
         position_ids = prepare_vis_position_ids(
             pixel_values, patch_attn_mask, tgt_sizes, model.config.vision_config.patch_size, model.config.vision_config.image_size // model.config.patch_size
         )
-        ov_model = ov.convert_model(vpm, example_input={"pixel_values": pixel_values, "position_ids": position_ids, "patch_attention_mask": patch_attn_mask})
+        ov_model = ov.convert_model(vpm, example_input={"pixel_values": pixel_values, "position_ids": position_ids, "patch_attention_mask": patch_attn_mask_float})
         ov.save_model(ov_model, model_dir / image_emb_path)
         del ov_model
         cleanup_torchscript_cache()
@@ -1072,7 +1077,7 @@ class OvMiniCPMO:
                             self.config.vision_config.image_size // self.config.patch_size,
                         )
                         start = time.perf_counter()
-                        tmp_hs = torch.from_numpy(self.vpm([block_pxl_values, block_patch_attn_mask, block_position_ids])[0])
+                        tmp_hs = torch.from_numpy(self.vpm([block_pxl_values, block_patch_attn_mask.float(), block_position_ids])[0])
                         self.vpm_times.append(time.perf_counter() - start)
                         hs.append(tmp_hs)
                     vision_embedding = torch.cat(hs, dim=0)
@@ -1085,7 +1090,7 @@ class OvMiniCPMO:
                         self.config.vision_config.image_size // self.config.patch_size,
                     )
                     start = time.perf_counter()
-                    vision_embedding = torch.from_numpy(self.vpm([all_pixel_values, patch_attn_mask, position_ids])[0])
+                    vision_embedding = torch.from_numpy(self.vpm([all_pixel_values, patch_attn_mask.float(), position_ids])[0])
                     self.vpm_times.append(time.perf_counter() - start)
                 vision_embedding = self.resampler(vision_embedding, tgt_sizes)
                 print("vision_embedding shape after resampler:", vision_embedding.shape)
