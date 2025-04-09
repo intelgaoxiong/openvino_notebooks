@@ -92,6 +92,7 @@ def calc_mean_and_std(durations):
 
     return mean, std
 
+vpm_mean, vpm_std = calc_mean_and_std(ov_model.vpm_times)
 durations = ov_model.llm.llm_times[1:]
 tpot_mean, tpot_std = calc_mean_and_std(durations)
 throughput_mean, throughput_std = [1000.0 / tpot_mean, (tpot_std * 1000.0) / (tpot_mean * tpot_mean)]
@@ -100,3 +101,6 @@ print(f"LLM compilation time: {ov_model.llm.llm_compilation_time} s")
 print(f"TTFT: {ttft_mean} ± {ttft_std} ms/token")
 print(f"TPOT: {tpot_mean} ± {tpot_std} ms/token")
 print(f"Throughput: {throughput_mean} ± {throughput_std} tokens/s")
+
+print(f"vision encoder throughput: {1000.0 / vpm_mean} ± {(vpm_std * 1000.0) / (vpm_mean * vpm_mean)}fps")
+print(f"vLLM embedding time: {ov_model.vllm_emb_time}m")

@@ -1,3 +1,4 @@
+import io
 import torch
 from threading import Thread
 from copy import deepcopy
@@ -939,6 +940,7 @@ class OvMiniCPMO:
         self.processor = processor
         self._pos_embeds = torch.from_numpy(get_2d_sincos_pos_embed(self.embed_dim, 70)).float()
         self.max_size = (70, 70)
+        self.vllm_emb_time = 0
         self.vpm_times = []
         self.resampler_times = []
 
@@ -951,13 +953,17 @@ class OvMiniCPMO:
         return self.llm
 
     def resampler(self, x, tgt_sizes):
+        print(f"[resampler] x shape {x.shape}")
+
         bs = x.shape[0]
+        token_len = x.shape[1]
 
         patch_len = tgt_sizes[:, 0] * tgt_sizes[:, 1]
 
         self._adjust_pos_cache(tgt_sizes)
 
-        max_patch_len = torch.max(patch_len)
+        # max_patch_len = torch.max(patch_len)
+        max_patch_len = token_len
         key_padding_mask = torch.zeros((bs, max_patch_len), dtype=torch.bool)
 
         pos_embed = []
@@ -967,6 +973,11 @@ class OvMiniCPMO:
             key_padding_mask[i, patch_len[i] :] = True
 
         pos_embed = torch.nn.utils.rnn.pad_sequence(pos_embed, batch_first=True, padding_value=0.0).permute(1, 0, 2)  # BLD => L * B * D
+        padding_needed = max_patch_len - pos_embed.shape[0]
+        pos_embed = torch.nn.functional.pad(pos_embed, (0, 0, 0, 0, 0, padding_needed), mode='constant', value=0.0)
+
+        print(f"[resampler] pos_embed shape {pos_embed.shape}")
+        print(f"[resampler] key_padding_mask shape {key_padding_mask.shape}")
 
         start = time.perf_counter()
         res = torch.from_numpy(self._resampler([x, pos_embed, key_padding_mask])[0])
@@ -1034,6 +1045,7 @@ class OvMiniCPMO:
         return input_lengths_after_cnn, input_lengths_after_pooling
 
     def get_vllm_embedding(self, data):
+        emb_start = time.perf_counter()
         if "vision_hidden_states" not in data:
             tgt_sizes = data["tgt_sizes"]
             pixel_values_list = data["pixel_values"]
@@ -1053,13 +1065,28 @@ class OvMiniCPMO:
 
                 all_pixel_values = torch.nn.utils.rnn.pad_sequence(all_pixel_values, batch_first=True, padding_value=0.0)
                 B, L, _ = all_pixel_values.shape
+
                 all_pixel_values = all_pixel_values.permute(0, 2, 1).reshape(B, 3, -1, L)
+
+                print(f"[vision encoder] orig all_pixel_values shape {all_pixel_values.shape}")
+                # TODO: Remove the hard coding
+                targetL = 14 * 1036
+                padding_needed = targetL - L
+                all_pixel_values = torch.nn.functional.pad(all_pixel_values, (0, padding_needed, 0, 0), mode='constant', value=0.0)
+                print(f"[vision encoder] new all_pixel_values shape {all_pixel_values.shape}")
 
                 patch_attn_mask = torch.zeros((B, 1, max_patches), dtype=torch.bool)
                 for i in range(B):
                     patch_attn_mask[i, 0, : tgt_sizes[i][0] * tgt_sizes[i][1]] = True
+                print(f"[vision encoder] orig patch_attn_mask shape {patch_attn_mask.shape}")
+                targetL = 1036
+                padding_needed = targetL - patch_attn_mask.shape[2]
+                patch_attn_mask = torch.nn.functional.pad(patch_attn_mask, (0, padding_needed, 0, 0), mode='constant', value=False)
+                print(f"[vision encoder] new patch_attn_mask shape {patch_attn_mask.shape}")
 
-                vision_batch_size = 32
+                # vision_batch_size = 32
+                # For NPU
+                vision_batch_size = 1
                 all_pixel_values = all_pixel_values
                 if B > vision_batch_size:
                     hs = []
@@ -1092,8 +1119,9 @@ class OvMiniCPMO:
                     start = time.perf_counter()
                     vision_embedding = torch.from_numpy(self.vpm([all_pixel_values, patch_attn_mask.float(), position_ids])[0])
                     self.vpm_times.append(time.perf_counter() - start)
+                print(f"[vision encoder] output vision_embedding shape: {vision_embedding.shape} {tgt_sizes.shape}")
                 vision_embedding = self.resampler(vision_embedding, tgt_sizes)
-                print("vision_embedding shape after resampler:", vision_embedding.shape)
+                print("[vision encoder] vision_embedding shape after resampler:", vision_embedding.shape)
 
                 start = 0
                 for pixel_values in pixel_values_list:
@@ -1126,6 +1154,8 @@ class OvMiniCPMO:
                     image_indices = torch.stack([torch.arange(r[0], r[1], dtype=torch.long) for r in cur_image_bound])
 
                     cur_vllm_emb.scatter_(0, image_indices.view(-1, 1).repeat(1, cur_vllm_emb.shape[-1]), cur_vs_hs.view(-1, cur_vs_hs.shape[-1]))
+        emb_end = time.perf_counter()
+        self.vllm_emb_time = emb_end - emb_start
         return vllm_embedding, vision_hidden_states
 
     def get_audio_embedding(self, data, chunk_length=-1, dummy=True):
@@ -1665,6 +1695,39 @@ class OvMiniCPMO:
 
             return answer
 
+def convert_to_static_shape(model, patch_size):
+    batch_size = 1
+    patch_len = 1036
+
+    shapes = {}
+
+    for input in model.inputs:
+        input_shape = input.partial_shape
+        input_name = input.any_name
+
+        if input_name.startswith("pixel_values"):
+            input_shape[0] = batch_size
+            input_shape[1] = 3
+            input_shape[2] = patch_size
+            input_shape[3] = patch_size * patch_len
+        elif input_name.startswith("patch_attention_mask"):
+            input_shape[0] = batch_size
+            input_shape[1] = 1
+            input_shape[2] = patch_len
+        #elif input_name.startswith("position_ids"):
+        else:
+            input_shape[0] = batch_size
+            input_shape[1] = patch_len
+
+        shapes[input] = input_shape
+
+        print(f"input_name: {input_name}")
+        print(f"input_shape: {shapes[input]}")
+
+    # Reshape the model
+    model.reshape(shapes)
+
+    return model
 
 def init_model(model_dir, llm_model_dir, device):
     config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
@@ -1672,10 +1735,32 @@ def init_model(model_dir, llm_model_dir, device):
     embedder_device = device
     if m_is_npu:
         embedder_device = "CPU"
+
+    blob_path = model_dir / Path("vit.blob")
+    if blob_path.exists():
+        try:
+            with blob_path.open("rb") as fin:
+                print("Import image encoder compiled blob!")
+                img_emb = core.import_model(fin.read(), device)
+                print("Import img emb done!")
+        except IOError:
+            raise Exception("Blob file can't be opened")
+    else:
+        img_emb_model = core.read_model(model_dir / image_emb_path)
+        img_emb_model = convert_to_static_shape(img_emb_model, config.vision_config.patch_size)
+        ov.serialize(img_emb_model, "image_encoder_static.xml")
+        print(f"Start to compile image encoder model, patch size:{config.vision_config.patch_size}, device:{device}")
+        img_emb = core.compile_model(img_emb_model, device)
+        try:
+            user_stream = io.BytesIO()
+            img_emb.export_model(user_stream)
+            with blob_path.open("wb") as fout:
+                fout.write(user_stream.getbuffer())
+        except IOError:
+            raise Exception("Blob file can't be exported")
+        print("Compile img emb done")
+
     llm = OvModelForCausalLMWithEmb(model_dir / llm_model_dir, device)
-    print("Start to compile img emb")
-    img_emb = core.compile_model(model_dir / image_emb_path, embedder_device)
-    print("Compile img emb done")
     aud_emb = core.compile_model(model_dir / audio_emb_path, embedder_device)
     resampler = core.compile_model(model_dir / resampler_path, embedder_device)
     processor = AutoProcessor.from_pretrained(model_dir, trust_remote_code=True)
