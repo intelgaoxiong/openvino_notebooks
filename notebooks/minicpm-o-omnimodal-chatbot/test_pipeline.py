@@ -20,7 +20,8 @@ print("use_int4_lang_model:", use_int4_lang_model.value)
 
 print("device:", device.value)
 
-ov_model = init_model(model_dir, llm_int4_path.parent, "NPU")
+#Use case requires larger LLM token length
+ov_model = init_model(model_dir, llm_int4_path.parent, "NPU", 2048, 128)
 tokenizer = ov_model.processor.tokenizer
 
 import math
@@ -85,3 +86,33 @@ res = ov_model.chat(
     return_dict=True,
 )
 print(res)
+
+def calc_mean_and_std(durations):
+    if len(durations) == 0:
+        return -1, -1
+
+    # Convert durations to milliseconds
+    durations_ms = np.array(durations) * 1000.0
+
+    # Calculate mean
+    mean = np.mean(durations_ms)
+
+    # Calculate standard deviation
+    std = np.std(durations_ms)
+
+    return mean, std
+
+vpm_mean, vpm_std = calc_mean_and_std(ov_model.vpm_times)
+durations = ov_model.llm.llm_times[1:]
+tpot_mean, tpot_std = calc_mean_and_std(durations)
+throughput_mean, throughput_std = [1000.0 / tpot_mean, (tpot_std * 1000.0) / (tpot_mean * tpot_mean)]
+ttft_mean, ttft_std = calc_mean_and_std([ov_model.llm.llm_times[0]])
+print(f"LLM compilation time: {ov_model.llm.llm_compilation_time} s")
+print(f"TTFT: {ttft_mean} ± {ttft_std} ms/token")
+print(f"TPOT: {tpot_mean} ± {tpot_std} ms/token")
+print(f"Throughput: {throughput_mean} ± {throughput_std} tokens/s")
+
+print(f"vision encoder throughput: {1000.0 / vpm_mean} ± {(vpm_std * 1000.0) / (vpm_mean * vpm_mean)}fps")
+print(f"vLLM embedding time: {ov_model.vllm_emb_time}m")
+
+print(f"audio encode time: {ov_model.apm_time}m")

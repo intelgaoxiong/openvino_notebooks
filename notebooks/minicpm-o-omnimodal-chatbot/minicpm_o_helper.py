@@ -705,7 +705,7 @@ def update_npu_config(config, model, kv_pos, kv_desc):
     rename_key(config, "GENERATE_HINT", "NPUW_LLM_GENERATE_HINT")
 
 class OvModelForCausalLMWithEmb(GenerationMixin):
-    def __init__(self, model_dir, device="CPU", ov_config=None, compile=True, slice_lm_head=True) -> None:
+    def __init__(self, model_dir, device="CPU", ov_config=None, compile=True, slice_lm_head=True, llm_max_prompt_len=1024, llm_min_response_len=128) -> None:
         self._supports_cache_class = False
         self.config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
         self.config.is_decoder = True
@@ -726,6 +726,8 @@ class OvModelForCausalLMWithEmb(GenerationMixin):
         self.input_names = [input_t.get_any_name() for input_t in self.model.inputs]
         self.main_input_name = "input_ids"
         self.llm_times = []
+        self.max_prompt_len=llm_max_prompt_len
+        self.min_response_len=llm_min_response_len
         if compile:
             self.compile()
 
@@ -741,7 +743,7 @@ class OvModelForCausalLMWithEmb(GenerationMixin):
             #self.request = core.compile_model(self.model, self._device, self.ov_config).create_infer_request()
 
             start = time.perf_counter()
-            kv_desc = KVDesc(max_prompt_len=1024, min_response_len=128)
+            kv_desc = KVDesc(max_prompt_len=self.max_prompt_len, min_response_len=self.min_response_len)
             kv_pos = KVAxesPosition(batch=0, seq_len=2)
             copy_config = self.ov_config
             if copy_config is None:
@@ -941,6 +943,7 @@ class OvMiniCPMO:
         self._pos_embeds = torch.from_numpy(get_2d_sincos_pos_embed(self.embed_dim, 70)).float()
         self.max_size = (70, 70)
         self.vllm_emb_time = 0
+        self.apm_time = 0
         self.vpm_times = []
         self.resampler_times = []
 
@@ -1178,6 +1181,7 @@ class OvMiniCPMO:
         """
 
         wavforms = data.get("audio_features", [])  # (bs, 80, frames) or [], multi audios need filled in advance
+        print(f"wavforms shape {wavforms.shape}")
         audio_feature_lens_raw = data.get("audio_feature_lens", [])  # list, [[x1, x2], [y1], [z1]]
         # exist audio
         if len(wavforms) > 0:
@@ -1207,7 +1211,9 @@ class OvMiniCPMO:
                 audio_attention_mask_ = torch.logical_or(audio_attention_mask_, torch.logical_not(chunk_mask))
 
             audio_attention_mask[audio_attention_mask_] = float("-inf")
+            apm_start = time.perf_counter()
             audio_outputs = self.apm([wavforms, audio_attention_mask])
+            self.apm_time = time.perf_counter() - apm_start
 
             audio_embeds = torch.from_numpy(audio_outputs[-1])
 
@@ -1242,7 +1248,7 @@ class OvMiniCPMO:
             audio_embeddings = self.get_audio_embedding_streaming(data)
         else:
             audio_embeddings = self.get_audio_embedding(data, chunk_length)
-
+        print(f"audio_embeddings len {len(input_embeddings)}")
         bs = len(input_embeddings)
         if len(data.get("audio_features", [])) > 0:
             assert len(audio_embeddings) == len(input_embeddings)
@@ -1621,6 +1627,7 @@ class OvMiniCPMO:
             input_audios_list.append(audios)
             audio_parts_list.append(audio_parts)
 
+        print("prompts_lists: ", prompts_lists)
         inputs = processor(
             prompts_lists,
             input_images_list,
@@ -1729,7 +1736,7 @@ def convert_to_static_shape(model, patch_size):
 
     return model
 
-def init_model(model_dir, llm_model_dir, device):
+def init_model(model_dir, llm_model_dir, device, max_prompt_len=1024, min_response_len=128):
     config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
     m_is_npu = device == "NPU"
     embedder_device = device
@@ -1760,7 +1767,7 @@ def init_model(model_dir, llm_model_dir, device):
             raise Exception("Blob file can't be exported")
         print("Compile img emb done")
 
-    llm = OvModelForCausalLMWithEmb(model_dir / llm_model_dir, device)
+    llm = OvModelForCausalLMWithEmb(model_dir / llm_model_dir, device, llm_max_prompt_len=max_prompt_len, llm_min_response_len=min_response_len)
     aud_emb = core.compile_model(model_dir / audio_emb_path, embedder_device)
     resampler = core.compile_model(model_dir / resampler_path, embedder_device)
     processor = AutoProcessor.from_pretrained(model_dir, trust_remote_code=True)
