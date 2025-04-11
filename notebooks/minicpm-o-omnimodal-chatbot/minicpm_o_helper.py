@@ -1181,7 +1181,13 @@ class OvMiniCPMO:
         """
 
         wavforms = data.get("audio_features", [])  # (bs, 80, frames) or [], multi audios need filled in advance
-        print(f"wavforms shape {wavforms.shape}")
+        print(f"[Audio encoder] wavforms shape {wavforms.shape}")
+        # TODO: Remove the hard coding
+        targetL = 1520
+        padding_needed = targetL - wavforms.shape[2]
+        wavforms = torch.nn.functional.pad(wavforms, (0, padding_needed, 0, 0), mode='constant', value=0.0)
+        print(f"[Audio encoder] padding wavforms shape {wavforms.shape}")
+
         audio_feature_lens_raw = data.get("audio_feature_lens", [])  # list, [[x1, x2], [y1], [z1]]
         # exist audio
         if len(wavforms) > 0:
@@ -1220,11 +1226,12 @@ class OvMiniCPMO:
                 end_idx = i + step
                 b_wavform = wavforms[start_idx:end_idx]
                 b_audio_attention_mask = audio_attention_mask[start_idx:end_idx]
+                print(f"[Audio encoder] b_wavform shape {b_wavform.shape}, b_audio_attention_mask shape {b_audio_attention_mask.shape}")
                 tmp_audio_output = torch.from_numpy(self.apm([b_wavform, b_audio_attention_mask])[-1])
-                print(f"tmp_audio_output shape {tmp_audio_output.shape}")
+                print(f"[Audio encoder] tmp_audio_output shape {tmp_audio_output.shape}")
                 output.append(tmp_audio_output)
             audio_outputs = torch.cat(output, dim=0)
-            print(f"audio_outputs shape {audio_outputs.shape}")
+            print(f"[Audio encoder] audio_outputs shape {audio_outputs.shape}")
             audio_embeds = audio_outputs
 
             """
@@ -1233,7 +1240,7 @@ class OvMiniCPMO:
             """
             self.apm_time = time.perf_counter() - apm_start
 
-            print(f"audio_embeds shape {audio_embeds.shape}")
+            print(f"[Audio encoder] audio_embeds shape {audio_embeds.shape}")
 
             _, feature_lens_after_pooling = self._get_feat_extract_output_lengths(audio_feature_lens)
 
@@ -1754,40 +1761,103 @@ def convert_to_static_shape(model, patch_size):
 
     return model
 
-def init_model(model_dir, llm_model_dir, device, max_prompt_len=1024, min_response_len=128):
-    config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
-    m_is_npu = device == "NPU"
-    embedder_device = device
-    if m_is_npu:
-        embedder_device = "CPU"
+def convert_apm_to_static_shape(model):
+    batch_size = 1
+    feature_len = 80
+    max_mel_seq_len = 1520
+    max_seq_len = (max_mel_seq_len - 1) // 2 + 1
 
-    blob_path = model_dir / Path("vit.blob")
+    shapes = {}
+
+    for input in model.inputs:
+        input_shape = input.partial_shape
+        input_name = input.any_name
+        numDim = len(input_shape)
+
+        if numDim == 3: # "input_features"
+            input_shape[0] = batch_size
+            input_shape[1] = feature_len
+            input_shape[2] = max_mel_seq_len
+        elif numDim == 4: # "attention_mask"
+            input_shape[0] = batch_size
+            input_shape[1] = 1
+            input_shape[2] = max_seq_len
+            input_shape[3] = max_seq_len
+
+        shapes[input] = input_shape
+
+        print(f"input_name: {input_name}")
+        print(f"input_shape: {shapes[input]}")
+
+    # Reshape the model
+    model.reshape(shapes)
+
+    return model
+
+def npu_model_import_or_compile(blob_path, model_path, convert_func, device, model_type, config=None):
+    """
+    Import or compile blob for NPU device, either audio or vision encoder.
+
+    Parameters:
+    - blob_path: Path to the compiled blob file.
+    - model_path: Path to the model file.
+    - convert_func: Function to convert the model to a static shape.
+    - device: Device to compile the model on.
+    - model_type: Type of the model ('audio' or 'vision').
+    - config: Optional configuration for vision encoder.
+    """
+
+    assert device == "NPU"
+
     if blob_path.exists():
         try:
             with blob_path.open("rb") as fin:
-                print("Import image encoder compiled blob!")
-                img_emb = core.import_model(fin.read(), device)
-                print("Import img emb done!")
+                print(f"Import {model_type} encoder compiled blob!")
+                model = core.import_model(fin.read(), device)
+                print(f"Import {model_type} emb done!")
         except IOError:
-            raise Exception("Blob file can't be opened")
+            raise Exception(f"{model_type.capitalize()} blob file can't be opened")
     else:
-        img_emb_model = core.read_model(model_dir / image_emb_path)
-        img_emb_model = convert_to_static_shape(img_emb_model, config.vision_config.patch_size)
-        ov.serialize(img_emb_model, "image_encoder_static.xml")
-        print(f"Start to compile image encoder model, patch size:{config.vision_config.patch_size}, device:{device}")
-        img_emb = core.compile_model(img_emb_model, device)
+        model = core.read_model(model_path)
+        if model_type == 'vision' and config:
+            model = convert_func(model, config.vision_config.patch_size)
+        else:
+            model = convert_func(model)
+
+        ov.serialize(model, f"{model_type}_encoder_static.xml")
+        print(f"Start to compile {model_type} encoder model, device:{device}")
+        model = core.compile_model(model, device)
         try:
             user_stream = io.BytesIO()
-            img_emb.export_model(user_stream)
+            model.export_model(user_stream)
             with blob_path.open("wb") as fout:
                 fout.write(user_stream.getbuffer())
         except IOError:
-            raise Exception("Blob file can't be exported")
-        print("Compile img emb done")
+            raise Exception(f"{model_type.capitalize()} blob file can't be exported")
+        print(f"Compile {model_type} emb done")
 
+    return model
+
+def init_model(model_dir, llm_model_dir, device, max_prompt_len=1024, min_response_len=128):
+    config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
+    m_is_npu = device == "NPU"
+    resampler_device = device
+    if m_is_npu:
+        resampler_device = "CPU"
+
+    # Audio encoder
+    audio_enc_blob_path = model_dir / Path("whisper_enc.blob")
+    aud_emb = npu_model_import_or_compile(audio_enc_blob_path, model_dir / audio_emb_path, convert_apm_to_static_shape, device, 'audio')
+
+    # Vision encoder
+    vision_enc_blob_path = model_dir / Path("vit.blob")
+    img_emb = npu_model_import_or_compile(vision_enc_blob_path, model_dir / image_emb_path, convert_to_static_shape, device, 'vision', config)
+
+    # LLM
     llm = OvModelForCausalLMWithEmb(model_dir / llm_model_dir, device, llm_max_prompt_len=max_prompt_len, llm_min_response_len=min_response_len)
-    aud_emb = core.compile_model(model_dir / audio_emb_path, embedder_device)
-    resampler = core.compile_model(model_dir / resampler_path, embedder_device)
+
+    # Resampler
+    resampler = core.compile_model(model_dir / resampler_path, resampler_device)
     processor = AutoProcessor.from_pretrained(model_dir, trust_remote_code=True)
 
     ov_model = OvMiniCPMO(config, img_emb, resampler, aud_emb, llm, processor)
