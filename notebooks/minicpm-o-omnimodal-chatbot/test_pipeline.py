@@ -103,6 +103,8 @@ def calc_mean_and_std(durations):
     return mean, std
 
 vpm_mean, vpm_std = calc_mean_and_std(ov_model.vpm_times)
+resampler_mean, resampler_std = calc_mean_and_std(ov_model.resampler_times)
+
 durations = ov_model.llm.llm_times[1:]
 tpot_mean, tpot_std = calc_mean_and_std(durations)
 throughput_mean, throughput_std = [1000.0 / tpot_mean, (tpot_std * 1000.0) / (tpot_mean * tpot_mean)]
@@ -113,6 +115,7 @@ print(f"TPOT: {tpot_mean} ± {tpot_std} ms/token")
 print(f"Throughput: {throughput_mean} ± {throughput_std} tokens/s")
 
 print(f"vision encoder throughput: {1000.0 / vpm_mean} ± {(vpm_std * 1000.0) / (vpm_mean * vpm_mean)}fps")
-print(f"vLLM embedding time: {ov_model.vllm_emb_time}m")
+print(f"Resampling throughput: {1000.0 / resampler_mean} ± {(resampler_std * 1000.0) / (resampler_mean * resampler_mean)}fps")
+print(f"vLLM embedding time: {ov_model.vllm_emb_time}m for {len(ov_model.vpm_times)} images")
 
 print(f"audio encode time: {ov_model.apm_time}m")
