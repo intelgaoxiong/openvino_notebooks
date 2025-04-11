@@ -1211,11 +1211,29 @@ class OvMiniCPMO:
                 audio_attention_mask_ = torch.logical_or(audio_attention_mask_, torch.logical_not(chunk_mask))
 
             audio_attention_mask[audio_attention_mask_] = float("-inf")
+
             apm_start = time.perf_counter()
+            step = 1
+            output = []
+            for i in range(0, batch_size, step):
+                start_idx = i
+                end_idx = i + step
+                b_wavform = wavforms[start_idx:end_idx]
+                b_audio_attention_mask = audio_attention_mask[start_idx:end_idx]
+                tmp_audio_output = torch.from_numpy(self.apm([b_wavform, b_audio_attention_mask])[-1])
+                print(f"tmp_audio_output shape {tmp_audio_output.shape}")
+                output.append(tmp_audio_output)
+            audio_outputs = torch.cat(output, dim=0)
+            print(f"audio_outputs shape {audio_outputs.shape}")
+            audio_embeds = audio_outputs
+
+            """
             audio_outputs = self.apm([wavforms, audio_attention_mask])
+            audio_embeds = torch.from_numpy(audio_outputs[-1])
+            """
             self.apm_time = time.perf_counter() - apm_start
 
-            audio_embeds = torch.from_numpy(audio_outputs[-1])
+            print(f"audio_embeds shape {audio_embeds.shape}")
 
             _, feature_lens_after_pooling = self._get_feat_extract_output_lengths(audio_feature_lens)
 
