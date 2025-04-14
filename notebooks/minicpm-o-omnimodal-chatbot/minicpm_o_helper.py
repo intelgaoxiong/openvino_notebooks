@@ -1888,7 +1888,9 @@ def npu_model_import_or_compile(blob_path, model_path, convert_func, device, mod
 
         ov.serialize(model, ir_name)
         print(f"Start to compile {ir_name}, device:{device}")
-        model = core.compile_model(model, device)
+        config = {}
+        update_config(config, ("NPU_DPU_GROUPS", "6"))
+        model = core.compile_model(model, device, config)
         try:
             user_stream = io.BytesIO()
             model.export_model(user_stream)
@@ -1908,15 +1910,15 @@ def init_model(model_dir, llm_model_dir, device, max_prompt_len=1024, min_respon
         resampler_device = "CPU"
 
     # Audio encoder
-    audio_enc_blob_path = model_dir / Path("whisper_enc.blob")
+    audio_enc_blob_path = Path("whisper_enc.blob")
     aud_emb = npu_model_import_or_compile(audio_enc_blob_path, model_dir / audio_emb_path, convert_apm_to_static_shape, device, 'audio')
 
     # Vision encoder
-    vision_enc_blob_path = model_dir / Path("vit.blob")
+    vision_enc_blob_path = Path("vision_enc.blob")
     img_emb = npu_model_import_or_compile(vision_enc_blob_path, model_dir / image_emb_path, convert_to_static_shape, device, 'vision', config)
 
     # Resampler
-    resampler_blob_path = model_dir / Path("resampler.blob")
+    resampler_blob_path = Path("resampler.blob")
     resampler = npu_model_import_or_compile(resampler_blob_path, model_dir / resampler_path, convert_resampler_to_static_shape, device, 'resampler')
 
     processor = AutoProcessor.from_pretrained(model_dir, trust_remote_code=True)
