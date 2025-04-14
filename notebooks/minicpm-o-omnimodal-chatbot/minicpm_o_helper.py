@@ -522,7 +522,7 @@ def convert_vision_encoder(model, model_dir):
     if not (model_dir / resampler_path).exists():
         print("⌛ Convert Resamler model")
 
-        def resampler_forward(self, x, pos_embed, key_padding_mask):
+        def resampler_forward(self, x, pos_embed, key_padding_mask_float):
             bs = x.shape[0]
             x = self.kv_proj(x)  # B * L * D
             x = self.ln_kv(x).permute(1, 0, 2)  # L * B * D
@@ -531,7 +531,8 @@ def convert_vision_encoder(model, model_dir):
 
             q_bs = q.unsqueeze(1).repeat(1, bs, 1)
 
-            out = self.attn(q_bs, x + pos_embed, x, key_padding_mask=key_padding_mask)[0]  # Q * B * D  # L * B * D +  L * B * D
+            key_padding_mask_bool = key_padding_mask_float.bool()
+            out = self.attn(q_bs, x + pos_embed, x, key_padding_mask=key_padding_mask_bool)[0]  # Q * B * D  # L * B * D +  L * B * D
             #  out: Q * B * D
             x = out.permute(1, 0, 2)  # B * Q * D
 
@@ -546,14 +547,14 @@ def convert_vision_encoder(model, model_dir):
         patch_len = tgt_sizes[:, 0] * tgt_sizes[:, 1]
 
         max_patch_len = torch.max(patch_len)
-        key_padding_mask = torch.zeros((1, max_patch_len), dtype=torch.bool)
+        key_padding_mask_float = torch.zeros((1, max_patch_len), dtype=torch.float)
 
         pos_embed = []
         tgt_h, tgt_w = tgt_sizes[0]
         pos_embed = torch.from_numpy(pos_embed_base[:tgt_h, :tgt_w, :].reshape((tgt_h * tgt_w, 1, -1)))  # patches * D
-        key_padding_mask[0, patch_len:] = True
+        key_padding_mask_float[0, patch_len:] = 1.0
 
-        ov_model = ov.convert_model(model.resampler, example_input=[torch.randn(1, 1032, 1152), pos_embed, key_padding_mask])
+        ov_model = ov.convert_model(model.resampler, example_input=[torch.randn(1, 1032, 1152), pos_embed, key_padding_mask_float])
         ov.save_model(ov_model, model_dir / resampler_path)
         del ov_model
         cleanup_torchscript_cache()
@@ -967,13 +968,13 @@ class OvMiniCPMO:
 
         # max_patch_len = torch.max(patch_len)
         max_patch_len = token_len
-        key_padding_mask = torch.zeros((bs, max_patch_len), dtype=torch.bool)
+        key_padding_mask = torch.zeros((bs, max_patch_len), dtype=torch.float)
 
         pos_embed = []
         for i in range(bs):
             tgt_h, tgt_w = tgt_sizes[i]
             pos_embed.append(self._pos_embeds[:tgt_h, :tgt_w, :].reshape((tgt_h * tgt_w, -1)))  # patches * D
-            key_padding_mask[i, patch_len[i] :] = True
+            key_padding_mask[i, patch_len[i] :] = 1.0
 
         pos_embed = torch.nn.utils.rnn.pad_sequence(pos_embed, batch_first=True, padding_value=0.0).permute(1, 0, 2)  # BLD => L * B * D
         padding_needed = max_patch_len - pos_embed.shape[0]
@@ -983,8 +984,21 @@ class OvMiniCPMO:
         print(f"[resampler] key_padding_mask shape {key_padding_mask.shape}")
 
         start = time.perf_counter()
-        res = torch.from_numpy(self._resampler([x, pos_embed, key_padding_mask])[0])
+        step = 1
+        output = []
+        for i in range(0, bs, step):
+            start_idx = i
+            end_idx = i + step
+            b_x = x[start_idx:end_idx]
+            b_pos_embed = pos_embed[:, start_idx:end_idx, :]
+            b_key_padding_mask = key_padding_mask[start_idx:end_idx]
+            tmp_resample_output = torch.from_numpy(self._resampler([b_x, b_pos_embed, b_key_padding_mask])[0])
+            output.append(tmp_resample_output)
+        res = torch.cat(output, dim=0)
         self.resampler_times.append(time.perf_counter() - start)
+
+        print(f"[resampler] Output shape {res.shape}")
+
         return res
 
     def _set_2d_pos_cache(self, max_size):
@@ -1794,6 +1808,46 @@ def convert_apm_to_static_shape(model):
 
     return model
 
+def convert_resampler_to_static_shape(model):
+    """
+    [resampler] x shape torch.Size([10, 1036, 1152])
+    [resampler] pos_embed shape torch.Size([1036, 10, 3584])
+    [resampler] key_padding_mask shape torch.Size([10, 1036])
+    """
+    batch_size = 1
+    token_len = 1036
+    feature_len = 1152
+    hidden_states_len = 3584
+
+    shapes = {}
+
+    for input in model.inputs:
+        input_shape = input.partial_shape
+        input_name = input.any_name
+        numDim = len(input_shape)
+
+        if input_name.startswith("x"):
+            input_shape[0] = batch_size
+            input_shape[1] = token_len
+            input_shape[2] = feature_len
+        elif input_name.startswith("pos_embed"):
+            input_shape[0] = token_len
+            input_shape[1] = batch_size
+            input_shape[2] = hidden_states_len
+        elif input_name.startswith("key_padding_mask"):
+            input_shape[0] = batch_size
+            input_shape[1] = 1036
+
+        shapes[input] = input_shape
+
+        print(f"input_name: {input_name}")
+        print(f"input_shape: {shapes[input]}")
+
+    # Reshape the model
+    model.reshape(shapes)
+
+    return model
+
 def npu_model_import_or_compile(blob_path, model_path, convert_func, device, model_type, config=None):
     """
     Import or compile blob for NPU device, either audio or vision encoder.
@@ -1821,11 +1875,19 @@ def npu_model_import_or_compile(blob_path, model_path, convert_func, device, mod
         model = core.read_model(model_path)
         if model_type == 'vision' and config:
             model = convert_func(model, config.vision_config.patch_size)
-        else:
+            ir_name = model_type + "_encoder_static.xml"
+        elif model_type == 'audio':
             model = convert_func(model)
+            ir_name = model_type + "_encoder_static.xml"
+        elif model_type == 'resampler':
+            model = convert_func(model)
+            ir_name = model_type + "_static.xml"
+        else:
+            print(f"Unsupported {model_type}")
+            assert(1)
 
-        ov.serialize(model, f"{model_type}_encoder_static.xml")
-        print(f"Start to compile {model_type} encoder model, device:{device}")
+        ov.serialize(model, ir_name)
+        print(f"Start to compile {ir_name}, device:{device}")
         model = core.compile_model(model, device)
         try:
             user_stream = io.BytesIO()
@@ -1853,12 +1915,14 @@ def init_model(model_dir, llm_model_dir, device, max_prompt_len=1024, min_respon
     vision_enc_blob_path = model_dir / Path("vit.blob")
     img_emb = npu_model_import_or_compile(vision_enc_blob_path, model_dir / image_emb_path, convert_to_static_shape, device, 'vision', config)
 
+    # Resampler
+    resampler_blob_path = model_dir / Path("resampler.blob")
+    resampler = npu_model_import_or_compile(resampler_blob_path, model_dir / resampler_path, convert_resampler_to_static_shape, device, 'resampler')
+
+    processor = AutoProcessor.from_pretrained(model_dir, trust_remote_code=True)
+
     # LLM
     llm = OvModelForCausalLMWithEmb(model_dir / llm_model_dir, device, llm_max_prompt_len=max_prompt_len, llm_min_response_len=min_response_len)
-
-    # Resampler
-    resampler = core.compile_model(model_dir / resampler_path, resampler_device)
-    processor = AutoProcessor.from_pretrained(model_dir, trust_remote_code=True)
 
     ov_model = OvMiniCPMO(config, img_emb, resampler, aud_emb, llm, processor)
     return ov_model
