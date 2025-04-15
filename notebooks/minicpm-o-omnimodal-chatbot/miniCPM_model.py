@@ -120,6 +120,21 @@ def read_from_images(file_list):
 
     return frames
 
+def calc_mean_and_std(durations):
+    if len(durations) == 0:
+        return -1, -1
+
+    # Convert durations to milliseconds
+    durations_ms = np.array(durations) * 1000.0
+
+    # Calculate mean
+    mean = np.mean(durations_ms)
+
+    # Calculate standard deviation
+    std = np.std(durations_ms)
+
+    return mean, std
+
 class MiniCPM:
 
     def __init__(self):
@@ -127,11 +142,42 @@ class MiniCPM:
         self.generate_audio = False  # miniCPM audio output performance is not enough, use text output + TTS
         self.session_id = '123'
         self.prompts = []
+        self.chat_start = 0
+    
+    def print_perf(self):
+        print("\n")
+        print("\033[34m*****************Performance metrix*****************\033[0m")
+        vpm_mean, vpm_std = calc_mean_and_std(self.model.vpm_times)
+        resampler_mean, resampler_std = calc_mean_and_std(self.model.resampler_times)
+
+        durations = self.model.llm.llm_times[1:]
+        tpot_mean, tpot_std = calc_mean_and_std(durations)
+        throughput_mean, throughput_std = [1000.0 / tpot_mean, (tpot_std * 1000.0) / (tpot_mean * tpot_mean)]
+        ttft_mean, ttft_std = calc_mean_and_std([self.model.llm.llm_times[0]])
+        print(f"LLM compilation time: {self.model.llm.llm_compilation_time} s")
+        print(f"TTFT: {ttft_mean} ± {ttft_std} ms/token")
+        print(f"TPOT: {tpot_mean} ± {tpot_std} ms/token")
+        print(f"Throughput: {throughput_mean} ± {throughput_std} tokens/s")
+
+        print(f"vision encoder throughput: {1000.0 / vpm_mean} ± {(vpm_std * 1000.0) / (vpm_mean * vpm_mean)}fps")
+        print(f"Resampling throughput: {1000.0 / resampler_mean} ± {(resampler_std * 1000.0) / (resampler_mean * resampler_mean)}fps")
+        print(f"vLLM embedding time: {self.model.vllm_emb_time}m for {len(self.model.vpm_times)} images")
+
+        print(f"audio encode time: {self.model.apm_time}m")
+
+        generate_time = time.perf_counter() - self.chat_start
+        print("generate_time: ", generate_time)
+        app_ttft = self.model.llm.m_new_token_times[0] - self.chat_start
+        tokens = len(self.model.llm.m_new_token_times)
+        duration = self.model.llm.m_new_token_times[-1] - self.model.llm.m_new_token_times[0]
+        fps = (tokens - 1) / duration
+        print("app_ttft: ", app_ttft)
+        print("fps: ", fps)
 
     def load_model(self):
         model_dir = Path("MiniCPM-o-2_6")
         llm_int4_path = Path("language_model_int4") / llm_path.name
-        ov_model = init_model(model_dir, llm_int4_path.parent, "NPU", 2048, 128)
+        ov_model = init_model(model_dir, llm_int4_path.parent, "NPU", 1024, 128)
         self.model = ov_model
         self.tokenizer = ov_model.processor.tokenizer
 
@@ -200,8 +246,10 @@ class MiniCPM:
     def query_model(self):
         output_audio_path = "output.wav"
 
+        self.chat_start = time.perf_counter()
         res = self.model.chat(
             msgs=self.prompts,
+            stream=True,
             tokenizer=self.tokenizer,
             sampling=True,
             temperature=0.5,
@@ -211,7 +259,7 @@ class MiniCPM:
             generate_audio=self.generate_audio,
             stopping_criteria=[self.stop_criteria],
             output_audio_path=output_audio_path,
-            max_slice_nums=1,
+            max_slice_nums=5,
             use_image_id=False,
             return_dict=True,
         )
@@ -251,6 +299,8 @@ class MiniCPM:
                 #    print("\n", end="")
                 #    sleep_time = int(response.json()['length']) / 5  # Estimate 3 words per second.
                 #    break
+
+        self.print_perf()
 
         return sleep_time
 

@@ -727,6 +727,8 @@ class OvModelForCausalLMWithEmb(GenerationMixin):
         self.input_names = [input_t.get_any_name() for input_t in self.model.inputs]
         self.main_input_name = "input_ids"
         self.llm_times = []
+        self.m_new_token_times = []
+
         self.max_prompt_len=llm_max_prompt_len
         self.min_response_len=llm_min_response_len
         if compile:
@@ -828,6 +830,7 @@ class OvModelForCausalLMWithEmb(GenerationMixin):
         # past_key_values are not used explicitly, instead they are handled inside the model
         if past_key_values is None:
             self.llm_times = []
+            self.m_new_token_times = []
             # This is the first iteration in a sequence, reset all states
             if self.request is not None:
                 self.request.reset_state()
@@ -899,6 +902,7 @@ class OvModelForCausalLMWithEmb(GenerationMixin):
         self.request.wait()
         # print("LLM infer done")
         self.llm_times.append(time.perf_counter() - start)
+        self.m_new_token_times.append(time.perf_counter())
         logits = self.request.get_tensor("logits").data
         logits = torch.from_numpy(logits).to(self.device)
         past_key_values = ((),)
@@ -993,7 +997,7 @@ class OvMiniCPMO:
         return self.llm
 
     def resampler(self, x, tgt_sizes):
-        print(f"[resampler] x shape {x.shape}")
+        # print(f"[resampler] x shape {x.shape}")
 
         bs = x.shape[0]
         token_len = x.shape[1]
@@ -1016,8 +1020,8 @@ class OvMiniCPMO:
         padding_needed = max_patch_len - pos_embed.shape[0]
         pos_embed = torch.nn.functional.pad(pos_embed, (0, 0, 0, 0, 0, padding_needed), mode='constant', value=0.0)
 
-        print(f"[resampler] pos_embed shape {pos_embed.shape}")
-        print(f"[resampler] key_padding_mask shape {key_padding_mask.shape}")
+        # print(f"[resampler] pos_embed shape {pos_embed.shape}")
+        # print(f"[resampler] key_padding_mask shape {key_padding_mask.shape}")
 
         start = time.perf_counter()
         step = 1
@@ -1033,7 +1037,7 @@ class OvMiniCPMO:
         res = torch.cat(output, dim=0)
         self.resampler_times.append(time.perf_counter() - start)
 
-        print(f"[resampler] Output shape {res.shape}")
+        # print(f"[resampler] Output shape {res.shape}")
 
         return res
 
@@ -1121,21 +1125,21 @@ class OvMiniCPMO:
 
                 all_pixel_values = all_pixel_values.permute(0, 2, 1).reshape(B, 3, -1, L)
 
-                print(f"[vision encoder] orig all_pixel_values shape {all_pixel_values.shape}")
+                # print(f"[vision encoder] orig all_pixel_values shape {all_pixel_values.shape}")
                 # TODO: Remove the hard coding
                 targetL = 14 * 1036
                 padding_needed = targetL - L
                 all_pixel_values = torch.nn.functional.pad(all_pixel_values, (0, padding_needed, 0, 0), mode='constant', value=0.0)
-                print(f"[vision encoder] new all_pixel_values shape {all_pixel_values.shape}")
+                # print(f"[vision encoder] new all_pixel_values shape {all_pixel_values.shape}")
 
                 patch_attn_mask = torch.zeros((B, 1, max_patches), dtype=torch.bool)
                 for i in range(B):
                     patch_attn_mask[i, 0, : tgt_sizes[i][0] * tgt_sizes[i][1]] = True
-                print(f"[vision encoder] orig patch_attn_mask shape {patch_attn_mask.shape}")
+                # print(f"[vision encoder] orig patch_attn_mask shape {patch_attn_mask.shape}")
                 targetL = 1036
                 padding_needed = targetL - patch_attn_mask.shape[2]
                 patch_attn_mask = torch.nn.functional.pad(patch_attn_mask, (0, padding_needed, 0, 0), mode='constant', value=False)
-                print(f"[vision encoder] new patch_attn_mask shape {patch_attn_mask.shape}")
+                # print(f"[vision encoder] new patch_attn_mask shape {patch_attn_mask.shape}")
 
                 # vision_batch_size = 32
                 # For NPU
@@ -1172,9 +1176,9 @@ class OvMiniCPMO:
                     start = time.perf_counter()
                     vision_embedding = torch.from_numpy(self.vpm([all_pixel_values, patch_attn_mask.float(), position_ids])[0])
                     self.vpm_times.append(time.perf_counter() - start)
-                print(f"[vision encoder] output vision_embedding shape: {vision_embedding.shape} {tgt_sizes.shape}")
+                # print(f"[vision encoder] output vision_embedding shape: {vision_embedding.shape} {tgt_sizes.shape}")
                 vision_embedding = self.resampler(vision_embedding, tgt_sizes)
-                print("[vision encoder] vision_embedding shape after resampler:", vision_embedding.shape)
+                # print("[vision encoder] vision_embedding shape after resampler:", vision_embedding.shape)
 
                 start = 0
                 for pixel_values in pixel_values_list:
@@ -1235,12 +1239,12 @@ class OvMiniCPMO:
         audio_feature_lens_raw = data.get("audio_feature_lens", [])  # list, [[x1, x2], [y1], [z1]]
         # exist audio
         if len(wavforms) > 0:
-            print(f"[Audio encoder] wavforms shape {wavforms.shape}")
+            # print(f"[Audio encoder] wavforms shape {wavforms.shape}")
             # TODO: Remove the hard coding
             targetL = 1520
             padding_needed = targetL - wavforms.shape[2]
             wavforms = torch.nn.functional.pad(wavforms, (0, padding_needed, 0, 0), mode='constant', value=0.0)
-            print(f"[Audio encoder] padding wavforms shape {wavforms.shape}")
+            # print(f"[Audio encoder] padding wavforms shape {wavforms.shape}")
             audio_feature_lens = torch.hstack(audio_feature_lens_raw)
             batch_size, _, max_mel_seq_len = wavforms.shape
             max_seq_len = (max_mel_seq_len - 1) // 2 + 1
@@ -1276,12 +1280,12 @@ class OvMiniCPMO:
                 end_idx = i + step
                 b_wavform = wavforms[start_idx:end_idx]
                 b_audio_attention_mask = audio_attention_mask[start_idx:end_idx]
-                print(f"[Audio encoder] b_wavform shape {b_wavform.shape}, b_audio_attention_mask shape {b_audio_attention_mask.shape}")
+                # print(f"[Audio encoder] b_wavform shape {b_wavform.shape}, b_audio_attention_mask shape {b_audio_attention_mask.shape}")
                 tmp_audio_output = torch.from_numpy(self.apm([b_wavform, b_audio_attention_mask])[-1])
-                print(f"[Audio encoder] tmp_audio_output shape {tmp_audio_output.shape}")
+                # print(f"[Audio encoder] tmp_audio_output shape {tmp_audio_output.shape}")
                 output.append(tmp_audio_output)
             audio_outputs = torch.cat(output, dim=0)
-            print(f"[Audio encoder] audio_outputs shape {audio_outputs.shape}")
+            # print(f"[Audio encoder] audio_outputs shape {audio_outputs.shape}")
             audio_embeds = audio_outputs
 
             """
@@ -1290,7 +1294,7 @@ class OvMiniCPMO:
             """
             self.apm_time = time.perf_counter() - apm_start
 
-            print(f"[Audio encoder] audio_embeds shape {audio_embeds.shape}")
+            # print(f"[Audio encoder] audio_embeds shape {audio_embeds.shape}")
 
             _, feature_lens_after_pooling = self._get_feat_extract_output_lengths(audio_feature_lens)
 
@@ -1323,7 +1327,7 @@ class OvMiniCPMO:
             audio_embeddings = self.get_audio_embedding_streaming(data)
         else:
             audio_embeddings = self.get_audio_embedding(data, chunk_length)
-        print(f"audio_embeddings len {len(input_embeddings)}")
+        # print(f"audio_embeddings len {len(input_embeddings)}")
         bs = len(input_embeddings)
         if len(data.get("audio_features", [])) > 0:
             assert len(audio_embeddings) == len(input_embeddings)
@@ -1370,7 +1374,7 @@ class OvMiniCPMO:
             if key in kwargs:
                 del kwargs[key]
 
-        print("vllm embedding shape: ", vllm_embedding.shape)
+        # print("vllm embedding shape: ", vllm_embedding.shape)
         return self.llm(input_ids=None, position_ids=position_ids, inputs_embeds=vllm_embedding, **kwargs)
 
     def _decode(self, inputs_embeds, tokenizer, attention_mask, decode_text=False, **kwargs):
@@ -1532,19 +1536,16 @@ class OvMiniCPMO:
 
         model_output = {}
         with torch.inference_mode():
-            print("get_vllm_embedding")
             model_inputs["inputs_embeds"], vision_hidden_states = self.get_vllm_embedding(model_inputs)
-            print("get_vllm_embedding done")
             shape = model_inputs["inputs_embeds"].shape
-            print("get_vllm_embedding shape:", shape)
+            #print("get_vllm_embedding shape:", shape)
             model_inputs["inputs_embeds"] = self.get_omni_embedding(
                 model_inputs,
                 input_embeddings=model_inputs["inputs_embeds"],
                 chunk_length=self.config.audio_chunk_length,
             )
-            print("get_omni_embedding done")
             shape = model_inputs["inputs_embeds"].shape
-            print("get_omni_embedding shape:", shape)
+            #print("get_omni_embedding shape:", shape)
 
             if stream:
                 result = self._decode_stream(model_inputs["inputs_embeds"], tokenizer, **kwargs)
@@ -1607,6 +1608,13 @@ class OvMiniCPMO:
             output_audio_path: audio save path when generate_audio
             **kwargs:
         """
+        self.vllm_emb_time = 0
+        self.apm_time = 0
+        self.vpm_times = []
+        self.resampler_times = []
+        self.llm.llm_times = []
+        self.llm.m_new_token_times = 0
+
         if isinstance(msgs[0], list):
             batched = True
         else:
@@ -1702,7 +1710,7 @@ class OvMiniCPMO:
             input_audios_list.append(audios)
             audio_parts_list.append(audio_parts)
 
-        print("prompts_lists: ", prompts_lists)
+        # print("prompts_lists: ", prompts_lists)
         inputs = processor(
             prompts_lists,
             input_images_list,

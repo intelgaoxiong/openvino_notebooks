@@ -162,7 +162,8 @@ class MultiListener:
                                 cv2.imwrite(camera_capture, vframe)
                                 self.cpmmodel.prefill_model(camera_capture, "image")
 
-                            self.cpmmodel.prefill_model(wav_path, "audio", mimick_prompt)
+                            # self.cpmmodel.prefill_model(wav_path, "audio", mimick_prompt)
+                            self.cpmmodel.prefill_model(wav_path, "audio")
                             self.need_camera = True
                             # hold on ASR to avoid capturing last TTS output sentence
 
