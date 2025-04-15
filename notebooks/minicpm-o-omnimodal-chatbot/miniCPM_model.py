@@ -1,11 +1,9 @@
 
+from pathlib import Path
 import torch
 import os
 from PIL import Image
 import shutil
-# from transformers import AutoModel, AutoTokenizer
-import intel_extension_for_pytorch as ipex
-from neural_compressor.transformers import AutoModel, AutoModelForCausalLM, RtnConfig
 from transformers import  AutoTokenizer, StoppingCriteria
 import time
 import queue
@@ -21,6 +19,8 @@ import time
 import librosa
 import requests
 
+from minicpm_o_helper import llm_path, lm_variant_selector, init_model
+
 # load omni model default, the default init_vision/init_audio/init_tts is True
 # if load vision-only model, please set init_audio=False and init_tts=False
 # if load audio-only model, please set init_vision=False
@@ -34,8 +34,8 @@ url_headers = {"Content-Type": "application/json"}
 welcome_words = "Hi, I am Intel AI assistant, it is my honor to talk with you。"
 
 data_queue = queue.Queue()
-MAX_NUM_FRAMES=64 # if cuda OOM set a smaller number
-
+#MAX_NUM_FRAMES=64 # if cuda OOM set a smaller number
+MAX_NUM_FRAMES=10
 class custom_stop(StoppingCriteria):
     def __init__(self, tokenizer):
         self.stop_count = 0
@@ -123,35 +123,23 @@ def read_from_images(file_list):
 class MiniCPM:
 
     def __init__(self):
-        self.device="xpu"
+        self.device="NPU"
         self.generate_audio = False  # miniCPM audio output performance is not enough, use text output + TTS
         self.session_id = '123'
+        self.prompts = []
 
     def load_model(self):
-        self.model = AutoModel.from_pretrained(
-            MODEL_PATH,
-            trust_remote_code=True,
-            attn_implementation='sdpa', # sdpa or flash_attention_2
-            torch_dtype=torch.float16,
-            # low_cpu_mem_usage=True,
-            init_vision=True,
-            init_audio=True,
-            init_tts=True
-        )
-
-        self.model=self.model.to(self.device)
-        print(self.model)
-        self.model = self.model.eval()
-        self.tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, torch_dtype=torch.float16,trust_remote_code=True)
-
-        # # In addition to vision-only mode, tts processor and vocos also needs to be initialized
-        self.model.init_tts()
-        self.model.tts.float()
+        model_dir = Path("MiniCPM-o-2_6")
+        llm_int4_path = Path("language_model_int4") / llm_path.name
+        ov_model = init_model(model_dir, llm_int4_path.parent, "NPU", 2048, 128)
+        self.model = ov_model
+        self.tokenizer = ov_model.processor.tokenizer
 
         self.stop_criteria = custom_stop(self.tokenizer)
 
         #Warm up session
-        video_path="screenshot.mp4"#"bbb_sunflower_2160p_60fps_normal.mp4"
+        # video_path="screenshot.mp4"#"bbb_sunflower_2160p_60fps_normal.mp4"
+        video_path = "MiniCPM-o-2_6/ckpt/assets/Skiing.mp4"
         frames = encode_video(video_path)
         question = "请用一句话回答下面的问题。 问题：表述这个视频"
         msgs = [
@@ -161,21 +149,20 @@ class MiniCPM:
         # Set decode params for video
         params = {}
         params["use_image_id"] = False
-        params["max_slice_nums"] = 5 # use 1 if cuda OOM and video resolution > 448*448  Tuning for quality & perf balance
-        
-        torch.xpu.synchronize()
+        params["max_slice_nums"] = 1 # use 1 if cuda OOM and video resolution > 448*448  Tuning for quality & perf balance
+
         st=time.time()
         answer = self.model.chat(
             msgs=msgs,
             tokenizer=self.tokenizer,
             **params
         )
-        torch.xpu.synchronize()
         et=time.time()
         output_len= self.tokenizer(answer, return_tensors="pt").input_ids.shape[-1]
         print("warmup time cost is ,output_len",et-st, output_len)
-        # print(answer)
-        self.model.reset_session()
+        print(answer)
+        # self.model.reset_session()
+        self.reset_model()
 
         payload = {'text': welcome_words}
         print("")
@@ -207,24 +194,28 @@ class MiniCPM:
             prompt, _ = librosa.load(message, sr=16000, mono=True)
             prompt_msg = [{"role":"user", "content": [system_prompt, prompt]}]
 
-        res = self.model.streaming_prefill(
-            session_id=self.session_id,
-            msgs=prompt_msg, 
-            tokenizer=self.tokenizer
-        )
-        # print("finished prefill")
-        return res
+        self.prompts.extend(prompt_msg)
 
     # submit question and send text output to TTS model in streaming mode
     def query_model(self):
-        res = self.model.streaming_generate(
-            session_id=self.session_id,
+        output_audio_path = "output.wav"
+
+        res = self.model.chat(
+            msgs=self.prompts,
             tokenizer=self.tokenizer,
-            temperature=0.3,
             sampling=True,
+            temperature=0.5,
+            max_new_tokens=4096,
+            omni_input=True,  # please set omni_input=True when omni inference
+            use_tts_template=True,
             generate_audio=self.generate_audio,
-            stopping_criteria=[self.stop_criteria]
+            stopping_criteria=[self.stop_criteria],
+            output_audio_path=output_audio_path,
+            max_slice_nums=1,
+            use_image_id=False,
+            return_dict=True,
         )
+        # print(res)
 
         text = ""
         # default sleep time (about one word speaking duration)
@@ -249,21 +240,22 @@ class MiniCPM:
                 data_queue.put(StreamChunk(is_end=True))
         else:
             for r in res:
-                text = r['text']
-                print(text, end="", flush=True)
-                payload = {'text': text}
+                print(r, end='', flush=True)
+                #text = r['text']
+                #print(text, end="", flush=True)
+                #payload = {'text': text}
                 # Take model streaming output and send through http directly
-                response = requests.post(url, json=payload, headers=url_headers)
+                #response = requests.post(url, json=payload, headers=url_headers)
                 # find last TTS output feedback, calculate sleep time to avoid TTS output captured by ASR
-                if "<|tts_eos|>" in text:
-                    print("\n", end="")
-                    sleep_time = int(response.json()['length']) / 5  # Estimate 3 words per second.
-                    break
-        
+                #if "<|tts_eos|>" in text:
+                #    print("\n", end="")
+                #    sleep_time = int(response.json()['length']) / 5  # Estimate 3 words per second.
+                #    break
+
         return sleep_time
 
     def reset_model(self):
-        self.model.reset_session()
+        self.prompts = []
 
 
 # model = MiniCPM()
