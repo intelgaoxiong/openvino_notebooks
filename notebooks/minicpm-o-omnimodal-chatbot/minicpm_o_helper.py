@@ -713,6 +713,7 @@ class OvModelForCausalLMWithEmb(GenerationMixin):
         self.config.is_encoder_decoder = False
         self.generation_config = GenerationConfig.from_model_config(self.config)
         model_dir = Path(model_dir)
+        self.weights_bin = str(model_dir / "language_model.bin")
         self.model = core.read_model(model_dir / "language_model.xml")
         self.token_emb = core.read_model(model_dir / "embed_tokens.xml")
         if slice_lm_head:
@@ -742,7 +743,7 @@ class OvModelForCausalLMWithEmb(GenerationMixin):
         if self.request is None:
             print("LLM compile on device: ", self._device)
             #self.request = core.compile_model(self.model, self._device, self.ov_config).create_infer_request()
-
+            """
             start = time.perf_counter()
             kv_desc = KVDesc(max_prompt_len=self.max_prompt_len, min_response_len=self.min_response_len)
             kv_pos = KVAxesPosition(batch=0, seq_len=2)
@@ -752,6 +753,41 @@ class OvModelForCausalLMWithEmb(GenerationMixin):
             update_npu_config(copy_config, self.model, kv_pos, kv_desc)
             self.request = core.compile_model(self.model, self._device, copy_config).create_infer_request()
             self.llm_compilation_time = time.perf_counter() - start
+            """
+            blob_path = Path("llm_npuw.blob")
+            copy_config = self.ov_config
+            if copy_config is None:
+                copy_config = {}
+            update_config(copy_config, ("WEIGHTS_PATH", self.weights_bin))
+            if blob_path.exists():
+                try:
+                    with blob_path.open("rb") as fin:
+                        print(f"Import llm NPUW compiled blob!")
+                        start = time.perf_counter()
+                        model = core.import_model(fin.read(), self._device, copy_config)
+                        self.llm_compilation_time = time.perf_counter() - start
+                        print(f"Import llm NPUW blob done!")
+                except IOError:
+                    raise Exception(f"blob file can't be opened")
+                self.request = model.create_infer_request()
+            else:
+                print(f"Start to compile llm model, device:{self._device}")
+                kv_desc = KVDesc(max_prompt_len=self.max_prompt_len, min_response_len=self.min_response_len)
+                kv_pos = KVAxesPosition(batch=0, seq_len=2)
+                update_npu_config(copy_config, self.model, kv_pos, kv_desc)
+                start = time.perf_counter()
+                model = core.compile_model(self.model, self._device, copy_config)
+                self.llm_compilation_time = time.perf_counter() - start
+                try:
+                    user_stream = io.BytesIO()
+                    model.export_model(user_stream)
+                    with blob_path.open("wb") as fout:
+                        fout.write(user_stream.getbuffer())
+                except IOError:
+                    raise Exception(f"blob file can't be exported")
+                print(f"Compile llm done")
+                self.request = model.create_infer_request()
+
         self._compile_token_emb()
 
     def _compile_token_emb(self):
@@ -1195,16 +1231,16 @@ class OvMiniCPMO:
         """
 
         wavforms = data.get("audio_features", [])  # (bs, 80, frames) or [], multi audios need filled in advance
-        print(f"[Audio encoder] wavforms shape {wavforms.shape}")
-        # TODO: Remove the hard coding
-        targetL = 1520
-        padding_needed = targetL - wavforms.shape[2]
-        wavforms = torch.nn.functional.pad(wavforms, (0, padding_needed, 0, 0), mode='constant', value=0.0)
-        print(f"[Audio encoder] padding wavforms shape {wavforms.shape}")
 
         audio_feature_lens_raw = data.get("audio_feature_lens", [])  # list, [[x1, x2], [y1], [z1]]
         # exist audio
         if len(wavforms) > 0:
+            print(f"[Audio encoder] wavforms shape {wavforms.shape}")
+            # TODO: Remove the hard coding
+            targetL = 1520
+            padding_needed = targetL - wavforms.shape[2]
+            wavforms = torch.nn.functional.pad(wavforms, (0, padding_needed, 0, 0), mode='constant', value=0.0)
+            print(f"[Audio encoder] padding wavforms shape {wavforms.shape}")
             audio_feature_lens = torch.hstack(audio_feature_lens_raw)
             batch_size, _, max_mel_seq_len = wavforms.shape
             max_seq_len = (max_mel_seq_len - 1) // 2 + 1
