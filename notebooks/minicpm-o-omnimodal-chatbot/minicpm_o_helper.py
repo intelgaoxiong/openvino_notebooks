@@ -743,52 +743,45 @@ class OvModelForCausalLMWithEmb(GenerationMixin):
     def compile(self):
         if self.request is None:
             print("LLM compile on device: ", self._device)
-            #self.request = core.compile_model(self.model, self._device, self.ov_config).create_infer_request()
-            """
-            start = time.perf_counter()
-            kv_desc = KVDesc(max_prompt_len=self.max_prompt_len, min_response_len=self.min_response_len)
-            kv_pos = KVAxesPosition(batch=0, seq_len=2)
-            copy_config = self.ov_config
-            if copy_config is None:
-                copy_config = {}
-            update_npu_config(copy_config, self.model, kv_pos, kv_desc)
-            self.request = core.compile_model(self.model, self._device, copy_config).create_infer_request()
-            self.llm_compilation_time = time.perf_counter() - start
-            """
-            copy_config = self.ov_config
-            if copy_config is None:
-                copy_config = {}
-            blob_path = self.model_dir.parent / ".npu_blob_cache" / "llm_npuw.blob"
-            weights_bin = self.model_dir / "language_model.bin"
-            update_config(copy_config, ("WEIGHTS_PATH", str(weights_bin)))
-            if blob_path.exists():
-                try:
-                    with blob_path.open("rb") as fin:
-                        print(f"Import llm NPUW compiled blob!")
-                        start = time.perf_counter()
-                        model = core.import_model(fin.read(), self._device, copy_config)
-                        self.llm_compilation_time = time.perf_counter() - start
-                        print(f"Import llm NPUW blob done!")
-                except IOError:
-                    raise Exception(f"blob file can't be opened")
-                self.request = model.create_infer_request()
+            m_is_npu = self._device == "NPU"
+            if not m_is_npu:
+                self.request = core.compile_model(self.model, self._device, self.ov_config).create_infer_request()
+
             else:
-                print(f"Start to compile llm model, device:{self._device}")
-                kv_desc = KVDesc(max_prompt_len=self.max_prompt_len, min_response_len=self.min_response_len)
-                kv_pos = KVAxesPosition(batch=0, seq_len=2)
-                update_npu_config(copy_config, self.model, kv_pos, kv_desc)
-                start = time.perf_counter()
-                model = core.compile_model(self.model, self._device, copy_config)
-                self.llm_compilation_time = time.perf_counter() - start
-                try:
-                    user_stream = io.BytesIO()
-                    model.export_model(user_stream)
-                    with blob_path.open("wb") as fout:
-                        fout.write(user_stream.getbuffer())
-                except IOError:
-                    raise Exception(f"blob file can't be exported")
-                print(f"Compile llm done")
-                self.request = model.create_infer_request()
+                copy_config = self.ov_config
+                if copy_config is None:
+                    copy_config = {}
+                blob_path = self.model_dir.parent / ".npu_blob_cache" / "llm_npuw.blob"
+                weights_bin = self.model_dir / "language_model.bin"
+                update_config(copy_config, ("WEIGHTS_PATH", str(weights_bin)))
+                if blob_path.exists():
+                    try:
+                        with blob_path.open("rb") as fin:
+                            print(f"Import llm NPUW compiled blob!")
+                            start = time.perf_counter()
+                            model = core.import_model(fin.read(), self._device, copy_config)
+                            self.llm_compilation_time = time.perf_counter() - start
+                            print(f"Import llm NPUW blob done!")
+                    except IOError:
+                        raise Exception(f"blob file can't be opened")
+                    self.request = model.create_infer_request()
+                else:
+                    print(f"Start to compile llm model, device:{self._device}")
+                    kv_desc = KVDesc(max_prompt_len=self.max_prompt_len, min_response_len=self.min_response_len)
+                    kv_pos = KVAxesPosition(batch=0, seq_len=2)
+                    update_npu_config(copy_config, self.model, kv_pos, kv_desc)
+                    start = time.perf_counter()
+                    model = core.compile_model(self.model, self._device, copy_config)
+                    self.llm_compilation_time = time.perf_counter() - start
+                    try:
+                        user_stream = io.BytesIO()
+                        model.export_model(user_stream)
+                        with blob_path.open("wb") as fout:
+                            fout.write(user_stream.getbuffer())
+                    except IOError:
+                        raise Exception(f"blob file can't be exported")
+                    print(f"Compile llm done")
+                    self.request = model.create_infer_request()
 
         self._compile_token_emb()
 
@@ -1785,7 +1778,7 @@ class OvMiniCPMO:
 
             return answer
 
-def convert_to_static_shape(model, patch_size):
+def convert_vpm_to_static_shape(model, patch_size):
     batch_size = 1
     patch_len = 1036
 
@@ -1910,19 +1903,19 @@ def npu_model_import_or_compile(blob_path, model_path, convert_func, device, mod
     if blob_path.exists():
         try:
             with blob_path.open("rb") as fin:
-                print(f"Import {model_type} encoder compiled blob!")
+                print(f"Import {model_type} compiled blob!")
                 model = core.import_model(fin.read(), device)
-                print(f"Import {model_type} emb done!")
+                print(f"Import {model_type} blob done!")
         except IOError:
             raise Exception(f"{model_type.capitalize()} blob file can't be opened")
     else:
         model = core.read_model(model_path)
-        if model_type == 'vision' and config:
+        if model_type == 'vision_encoder' and config:
             model = convert_func(model, config.vision_config.patch_size)
-            ir_name = model_type + "_encoder_static.xml"
+            ir_name = model_type + "_static.xml"
         elif model_type == 'audio':
             model = convert_func(model)
-            ir_name = model_type + "_encoder_static.xml"
+            ir_name = model_type + "_static.xml"
         elif model_type == 'resampler':
             model = convert_func(model)
             ir_name = model_type + "_static.xml"
@@ -1942,33 +1935,43 @@ def npu_model_import_or_compile(blob_path, model_path, convert_func, device, mod
                 fout.write(user_stream.getbuffer())
         except IOError:
             raise Exception(f"{model_type.capitalize()} blob file can't be exported")
-        print(f"Compile {model_type} emb done")
+        print(f"Compile {model_type} done")
 
     return model
 
 def init_model(model_dir, llm_model_dir, device, max_prompt_len=1024, min_response_len=128):
     config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
     m_is_npu = device == "NPU"
-    resampler_device = device
+
     if m_is_npu:
-        resampler_device = "CPU"
+        # Audio encoder
+        audio_enc_blob_path = model_dir / ".npu_blob_cache" / "whisper_enc.blob"
+        aud_emb = npu_model_import_or_compile(audio_enc_blob_path, model_dir / audio_emb_path, convert_apm_to_static_shape, device, 'audio_encoder')
 
-    # Audio encoder
-    audio_enc_blob_path = model_dir / ".npu_blob_cache" / "whisper_enc.blob"
-    aud_emb = npu_model_import_or_compile(audio_enc_blob_path, model_dir / audio_emb_path, convert_apm_to_static_shape, device, 'audio')
+        # Vision encoder
+        vision_enc_blob_path = model_dir / ".npu_blob_cache" / "vision_enc.blob"
+        img_emb = npu_model_import_or_compile(vision_enc_blob_path, model_dir / image_emb_path, convert_vpm_to_static_shape, device, 'vision_encoder', config)
 
-    # Vision encoder
-    vision_enc_blob_path = model_dir / ".npu_blob_cache" / "vision_enc.blob"
-    img_emb = npu_model_import_or_compile(vision_enc_blob_path, model_dir / image_emb_path, convert_to_static_shape, device, 'vision', config)
+        # Resampler
+        resampler_blob_path = model_dir / ".npu_blob_cache" / "resampler.blob"
+        resampler = npu_model_import_or_compile(resampler_blob_path, model_dir / resampler_path, convert_resampler_to_static_shape, device, 'resampler')
 
-    # Resampler
-    resampler_blob_path = model_dir / ".npu_blob_cache" / "resampler.blob"
-    resampler = npu_model_import_or_compile(resampler_blob_path, model_dir / resampler_path, convert_resampler_to_static_shape, device, 'resampler')
+        # LLM
+        llm = OvModelForCausalLMWithEmb(model_dir / llm_model_dir, device, llm_max_prompt_len=max_prompt_len, llm_min_response_len=min_response_len)
+    else:
+        # Audio encoder
+        aud_emb = core.compile_model(model_dir / audio_emb_path, device)
+
+        # Vision encoder
+        img_emb = core.compile_model(model_dir / image_emb_path, device)
+
+        # Resampler
+        resampler = core.compile_model(model_dir / resampler_path, device)
+
+        # LLM
+        llm = OvModelForCausalLMWithEmb(model_dir / llm_model_dir, device)
 
     processor = AutoProcessor.from_pretrained(model_dir, trust_remote_code=True)
-
-    # LLM
-    llm = OvModelForCausalLMWithEmb(model_dir / llm_model_dir, device, llm_max_prompt_len=max_prompt_len, llm_min_response_len=min_response_len)
 
     ov_model = OvMiniCPMO(config, img_emb, resampler, aud_emb, llm, processor)
     return ov_model
