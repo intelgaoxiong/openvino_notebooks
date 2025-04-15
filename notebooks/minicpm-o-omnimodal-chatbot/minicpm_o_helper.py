@@ -712,8 +712,7 @@ class OvModelForCausalLMWithEmb(GenerationMixin):
         self.config.is_decoder = True
         self.config.is_encoder_decoder = False
         self.generation_config = GenerationConfig.from_model_config(self.config)
-        model_dir = Path(model_dir)
-        self.weights_bin = str(model_dir / "language_model.bin")
+        self.model_dir = model_dir
         self.model = core.read_model(model_dir / "language_model.xml")
         self.token_emb = core.read_model(model_dir / "embed_tokens.xml")
         if slice_lm_head:
@@ -754,11 +753,12 @@ class OvModelForCausalLMWithEmb(GenerationMixin):
             self.request = core.compile_model(self.model, self._device, copy_config).create_infer_request()
             self.llm_compilation_time = time.perf_counter() - start
             """
-            blob_path = Path("llm_npuw.blob")
             copy_config = self.ov_config
             if copy_config is None:
                 copy_config = {}
-            update_config(copy_config, ("WEIGHTS_PATH", self.weights_bin))
+            blob_path = self.model_dir.parent / ".npu_blob_cache" / "llm_npuw.blob"
+            weights_bin = self.model_dir / "language_model.bin"
+            update_config(copy_config, ("WEIGHTS_PATH", str(weights_bin)))
             if blob_path.exists():
                 try:
                     with blob_path.open("rb") as fin:
@@ -1872,7 +1872,7 @@ def convert_resampler_to_static_shape(model):
             input_shape[2] = hidden_states_len
         elif input_name.startswith("key_padding_mask"):
             input_shape[0] = batch_size
-            input_shape[1] = 1036
+            input_shape[1] = token_len
 
         shapes[input] = input_shape
 
@@ -1922,7 +1922,7 @@ def npu_model_import_or_compile(blob_path, model_path, convert_func, device, mod
             print(f"Unsupported {model_type}")
             assert(1)
 
-        ov.serialize(model, ir_name)
+        ov.serialize(model, blob_path.parent / ir_name)
         print(f"Start to compile {ir_name}, device:{device}")
         config = {}
         update_config(config, ("NPU_DPU_GROUPS", "6"))
@@ -1946,15 +1946,15 @@ def init_model(model_dir, llm_model_dir, device, max_prompt_len=1024, min_respon
         resampler_device = "CPU"
 
     # Audio encoder
-    audio_enc_blob_path = Path("whisper_enc.blob")
+    audio_enc_blob_path = model_dir / ".npu_blob_cache" / "whisper_enc.blob"
     aud_emb = npu_model_import_or_compile(audio_enc_blob_path, model_dir / audio_emb_path, convert_apm_to_static_shape, device, 'audio')
 
     # Vision encoder
-    vision_enc_blob_path = Path("vision_enc.blob")
+    vision_enc_blob_path = model_dir / ".npu_blob_cache" / "vision_enc.blob"
     img_emb = npu_model_import_or_compile(vision_enc_blob_path, model_dir / image_emb_path, convert_to_static_shape, device, 'vision', config)
 
     # Resampler
-    resampler_blob_path = Path("resampler.blob")
+    resampler_blob_path = model_dir / ".npu_blob_cache" / "resampler.blob"
     resampler = npu_model_import_or_compile(resampler_blob_path, model_dir / resampler_path, convert_resampler_to_static_shape, device, 'resampler')
 
     processor = AutoProcessor.from_pretrained(model_dir, trust_remote_code=True)

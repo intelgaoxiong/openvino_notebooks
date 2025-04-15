@@ -20,7 +20,7 @@ from minicpm_o_helper import llm_path, copy_llm_files
 from nncf import BackupMode
 
 #compression_configuration = {"mode": nncf.CompressWeightsMode.INT4_SYM, "group_size": 128, "ratio": 1.0, "all_layers": True}
-compression_configuration = {"mode": nncf.CompressWeightsMode.INT4_SYM, "group_size": 128, "ratio": 1.0}
+compression_configuration = {"mode": nncf.CompressWeightsMode.NF4, "group_size": -1, "ratio": 1.0}
 
 core = ov.Core()
 llm_int4_path = Path("language_model_int4") / llm_path.name
