@@ -18,6 +18,7 @@ from silero_vad import load_silero_vad, read_audio, get_speech_timestamps
 import tkinter as tk
 import sys
 import cv2 
+import queue
 
 system_prompt = "You are an AI assistant, can answer questions based on user input,"
 #system_prompt = "你是一个AI夸人助手。你能接受视频，音频和文本输入并输出简短的语音和文本，请用热情洋溢的赞美口吻，中文回答问题，最好是用夸人的预期赞美你看到的。"
@@ -114,6 +115,18 @@ class MultiListener:
 
     def calculate_hash(self, content):
         return hashlib.md5(str(content).encode()).hexdigest() if content else None
+    
+    def display_frames(self):
+        while self.running:
+            if not self.frame_queue.empty():
+                frame = self.frame_queue.get()
+                cv2.imshow('Frame', frame)
+                key = cv2.waitKey(0) & 0xFF
+                if key == ord(' '):  # Space
+                    cv2.destroyAllWindows()
+
+            time.sleep(0.1)
+        cv2.destroyAllWindows()
 
     def audio_listener(self):
         self.stream = self.audio.open(
@@ -158,6 +171,8 @@ class MultiListener:
                                 for _ in range(3):
                                     self.capture.read()
                                 ret, vframe = self.capture.read()
+                                if not self.frame_queue.full():
+                                    self.frame_queue.put(vframe)
                                 # resized_frame = cv2.resize(vframe, (640, 480), interpolation=cv2.INTER_LINEAR)
                                 cv2.imwrite(camera_capture, vframe)
                                 self.cpmmodel.prefill_model(camera_capture, "image")
@@ -263,14 +278,17 @@ class MultiListener:
 
     def start(self):
         print("Start listening")
-        self.update_status_image(True) 
+        self.update_status_image(True)
+        self.frame_queue = queue.Queue(maxsize=10)
         audio_thread = threading.Thread(target=self.audio_listener)
         clipboard_thread = threading.Thread(target=self.clipboard_listener)
         screenshot_thread = threading.Thread(target=self.screenshot_listener)
-        
+        display_thread = threading.Thread(target=self.display_frames)
+
         audio_thread.start()
         clipboard_thread.start()
         screenshot_thread.start()
+        display_thread.start()
 
         keyboard.add_hotkey('esc', self.stop)
         keyboard.add_hotkey('L', self.suspend)
