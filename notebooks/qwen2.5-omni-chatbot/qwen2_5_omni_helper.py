@@ -1,3 +1,4 @@
+import io
 from pathlib import Path
 import types
 import gc
@@ -273,7 +274,8 @@ def convert_qwen2_5_omni_model(model_id, output_dir, quantization_config=None):
     print(f"⌛ {model_id} conversion started. Be patient, it may takes some time.")
     print("⌛ Load Original model")
     model = Qwen2_5OmniForConditionalGeneration.from_pretrained(ckpt, torch_dtype=torch.float32, device_map="cpu")
-    processor = AutoProcessor.from_pretrained(ckpt, trust_remote_code=True)
+    max_pixels = 2048 * 14 * 14 # Limit max pixel to 2K tokens to prevent too long input seq lens on NPU
+    processor = AutoProcessor.from_pretrained(ckpt, max_pixels=max_pixels, trust_remote_code=True)
 
     model.config.save_pretrained(output_dir)
     processor.save_pretrained(output_dir)
@@ -1009,13 +1011,143 @@ def get_rope_index(
         return position_ids, mrope_position_deltas
 
 
+def convert_visual_merger_to_static_shape(model):
+    batch_size = 1
+    max_seq_len = 2048
+    feature_len = 1280
+
+    shapes = {}
+
+    for input in model.inputs:
+        input_shape = input.partial_shape
+        input_name = input.any_name
+
+        if input_name.startswith("hidden_states"):
+            input_shape[0] = max_seq_len
+            input_shape[1] = feature_len
+        elif input_name.startswith("attention_mask"):
+            input_shape[0] = batch_size
+            input_shape[1] = max_seq_len
+            input_shape[2] = max_seq_len
+        elif input_name.startswith("window_attention_mask"):
+            input_shape[0] = batch_size
+            input_shape[1] = max_seq_len
+            input_shape[2] = max_seq_len
+        elif input_name.startswith("window_index"):
+            input_shape[0] = max_seq_len // 4
+        elif input_name.startswith("rotary_pos_emb"):
+            input_shape[0] = max_seq_len
+            input_shape[1] = 40
+
+        shapes[input] = input_shape
+
+        print(f"input_name: {input_name}")
+        print(f"input_shape: {shapes[input]}")
+
+    # Reshape the model
+    model.reshape(shapes)
+
+    return model
+
+def update_config(config, pair):
+    if pair[0] not in config:
+        config[pair[0]] = pair[1]
+
+def rename_key(config, old_key, new_key):
+    if old_key in config:
+        opt_value = config.pop(old_key)
+        config[new_key] = opt_value
+
+class KVAxesPosition:
+    def __init__(self, batch: int, seq_len: int):
+        self.batch = batch
+        self.seq_len = seq_len
+
+class KVDesc:
+    def __init__(self, max_prompt_len: int, min_response_len: int):
+        self.max_prompt_len = max_prompt_len
+        self.min_response_len = min_response_len
+
+def update_npu_config(config, model, kv_pos, kv_desc):
+    update_config(config, ("NPU_USE_NPUW", "YES"))
+    update_config(config, ("NPUW_LLM", "YES"))
+
+    update_config(config, ("NPUW_LLM_BATCH_DIM", kv_pos.batch))
+    update_config(config, ("NPUW_LLM_SEQ_LEN_DIM", kv_pos.seq_len))
+
+    update_config(config, ("NPUW_LLM_MAX_PROMPT_LEN", kv_desc.max_prompt_len))
+    update_config(config, ("NPUW_LLM_MIN_RESPONSE_LEN", kv_desc.min_response_len))
+
+    # update_config(config, ("NPUW_DUMP_SUBS", "YES"))
+    update_config(config, ("NPU_COMPILER_DYNAMIC_QUANTIZATION", "YES"))
+
+    rename_key(config, "++PREFILL_CONFIG", "++NPUW_LLM_PREFILL_CONFIG")
+    rename_key(config, "++GENERATE_CONFIG", "++NPUW_LLM_GENERATE_CONFIG")
+    rename_key(config, "PREFILL_CONFIG", "NPUW_LLM_PREFILL_CONFIG")
+    rename_key(config, "PREFILL_HINT", "NPUW_LLM_PREFILL_HINT")
+    rename_key(config, "GENERATE_CONFIG", "NPUW_LLM_GENERATE_CONFIG")
+    rename_key(config, "GENERATE_HINT", "NPUW_LLM_GENERATE_HINT")
+
+def npu_model_import_or_compile(blob_path, model_path, convert_func, device, model_type, config=None):
+    """
+    Import or compile blob for NPU device, either audio or vision encoder.
+
+    Parameters:
+    - blob_path: Path to the compiled blob file.
+    - model_path: Path to the model file.
+    - convert_func: Function to convert the model to a static shape.
+    - device: Device to compile the model on.
+    - model_type: Type of the model ('audio' or 'vision').
+    - config: Optional configuration for vision encoder.
+    """
+
+    assert device == "NPU"
+
+    if blob_path.exists():
+        try:
+            with blob_path.open("rb") as fin:
+                print(f"Import {model_type} compiled blob!")
+                model = core.import_model(fin.read(), device)
+                print(f"Import {model_type} blob done!")
+        except IOError:
+            raise Exception(f"{model_type.capitalize()} blob file can't be opened")
+    else:
+        model = core.read_model(model_path)
+        if model_type == 'visual_merger':
+            model = convert_func(model)
+            ir_name = model_type + "_static.xml"
+        else:
+            print(f"Unsupported {model_type}")
+            assert(1)
+
+        ov.serialize(model, blob_path.parent / ir_name)
+        print(f"Start to compile {ir_name}, device:{device}")
+        config = {}
+        update_config(config, ("NPU_DPU_GROUPS", "6"))
+        model = core.compile_model(model, device, config)
+        try:
+            user_stream = io.BytesIO()
+            model.export_model(user_stream)
+            with blob_path.open("wb") as fout:
+                fout.write(user_stream.getbuffer())
+        except IOError:
+            raise Exception(f"{model_type.capitalize()} blob file can't be exported")
+        print(f"Compile {model_type} done")
+
+    return model
+
 class OVQwen2_5OmniThinkerForConditionalGeneration(GenerationMixin):
     def __init__(self, model_dir, device, config):
         self.model = core.read_model(model_dir / "openvino_thinker_language_model.xml")
         self.audio = core.compile_model(model_dir / "openvino_thinker_audio_model.xml", "CPU")
         self.audio_state = core.compile_model(model_dir / "openvino_thinker_audio_state_model.xml", "CPU")
         self.visual_patcher = core.compile_model(model_dir / "openvino_thinker_patcher_model.xml", "CPU")
-        self.visual_merger = core.compile_model(model_dir / "openvino_thinker_merger_model.xml", "CPU")
+
+        visual_merger_blob_path = model_dir / ".npu_blob_cache" / "visual_merger.blob"
+        # self.visual_merger = npu_model_import_or_compile(visual_merger_blob_path, model_dir / "openvino_thinker_merger_model.xml", convert_visual_merger_to_static_shape, "NPU", 'visual_merger')
+        # self.visual_merger = core.compile_model(model_dir / ".npu_blob_cache" / "visual_merger_static.xml", "CPU")
+        self.visual_merger = core.compile_model(model_dir / "openvino_thinker_merger_model.xml", "GPU")
+
         self.embed_tokens = core.compile_model(model_dir / "openvino_thinker_embedding_model.xml", "CPU")
         self.input_names = {key.get_any_name(): idx for idx, key in enumerate(self.model.inputs)}
         self.output_names = {key.get_any_name(): idx for idx, key in enumerate(self.model.outputs)}
@@ -1139,6 +1271,7 @@ class OVQwen2_5OmniThinkerForConditionalGeneration(GenerationMixin):
         cu_window_seqlens: list = [0]
         window_index_id = 0
         vit_merger_window_size = self.window_size // self.spatial_merge_size // self.patch_size
+        print(f"vit_merger_window_size {vit_merger_window_size}, self.window_size {self.window_size}, self.spatial_merge_size {self.spatial_merge_size}, self.patch_size {self.patch_size}")
 
         for grid_t, grid_h, grid_w in grid_thw:
             llm_grid_h, llm_grid_w = (
@@ -1176,16 +1309,27 @@ class OVQwen2_5OmniThinkerForConditionalGeneration(GenerationMixin):
         return window_index, cu_window_seqlens
 
     def visual(self, pixel_values, grid_thw, **kwargs):
-        hidden_states = self.visual_patcher(pixel_values)[0]
+        print(f"visual start:")
+        print(f"[visual_patcher] pixel_values shape: {pixel_values.shape}")
+        hidden_states = torch.from_numpy(self.visual_patcher(pixel_values)[0])
+        print(f"[visual_patcher] hidden_states shape: {hidden_states.shape}")
+
+        orig_token_len = hidden_states.shape[0]
+
+        print(f"grid_thw is {grid_thw}")
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
         window_index, cu_window_seqlens = self.get_window_index(grid_thw)
         cu_window_seqlens = torch.tensor(
             cu_window_seqlens,
             dtype=torch.int32,
         )
+
         cu_window_seqlens = torch.unique_consecutive(cu_window_seqlens)
         cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(dim=0, dtype=torch.int32)
         cu_seqlens = torch.nn.functional.pad(cu_seqlens, (1, 0), value=0)
+        print(f"cu_seqlens shape {cu_seqlens.shape}")
+        print(f"cu_seqlens {cu_seqlens}")
+        print(f"cu_window_seqlens shape {cu_window_seqlens.shape}")
         attention_mask = torch.zeros((1, hidden_states.shape[0], hidden_states.shape[0]), dtype=torch.bool)
         causal_mask = torch.zeros_like(attention_mask, dtype=torch.float32)
         for i in range(1, len(cu_seqlens)):
@@ -1194,13 +1338,41 @@ class OVQwen2_5OmniThinkerForConditionalGeneration(GenerationMixin):
         causal_mask.masked_fill_(torch.logical_not(attention_mask), float("-inf"))
 
         window_attention_mask = torch.zeros((1, hidden_states.shape[0], hidden_states.shape[0]), dtype=torch.bool)
-        window_causal_mask = torch.zeros_like(attention_mask, dtype=torch.float32)
+        window_causal_mask = torch.zeros_like(window_attention_mask, dtype=torch.float32)
         for i in range(1, len(cu_window_seqlens)):
             window_attention_mask[..., cu_window_seqlens[i - 1] : cu_window_seqlens[i], cu_window_seqlens[i - 1] : cu_window_seqlens[i]] = True
 
         window_causal_mask.masked_fill_(torch.logical_not(window_attention_mask), float("-inf"))
 
+        # TODO: Remove the hard coding
+        targetL = 2048
+        padding_needed = targetL - hidden_states.shape[0]
+        hidden_states = torch.nn.functional.pad(hidden_states, (0, 0, 0, padding_needed), mode='constant', value=0.0)
+        print(f"[visual_patcher] hidden_states shape after padding: {hidden_states.shape}")
+
+        causal_mask = torch.nn.functional.pad(causal_mask, (0, padding_needed, 0, padding_needed), mode='constant', value=float("-inf"))
+        window_causal_mask = torch.nn.functional.pad(window_causal_mask, (0, padding_needed, 0, padding_needed), mode='constant', value=float("-inf"))
+
+        # TODO: Remove the hard coding
+        targetL = 2048
+        padding_needed = targetL - rotary_pos_emb.shape[0]
+        rotary_pos_emb = torch.nn.functional.pad(rotary_pos_emb, (0, 0, 0, padding_needed), mode='constant', value=0.0)
+        print(f"[visual_patcher] rotary_pos_emb shape after padding: {rotary_pos_emb.shape}")
+
+        targetL = 2048 // 4
+        padding_needed = targetL - window_index.shape[0]
+        window_index = torch.nn.functional.pad(window_index, (0, padding_needed), "constant", -100)
+        print(f"[visual_patcher] window_index shape after padding: {window_index.shape}")
+        print(f"[visual_merger] hidden_states shape: {hidden_states.shape}")
+        print(f"[visual_merger] causal_mask shape: {causal_mask.shape}")
+        print(f"[visual_merger] window_causal_mask shape: {window_causal_mask.shape}")
+        print(f"[visual_merger] window_index shape: {window_index.shape}")
+        print(f"[visual_merger] rotary_pos_emb shape: {rotary_pos_emb.shape}")
+
+
         res = self.visual_merger([hidden_states, causal_mask, window_causal_mask, window_index, rotary_pos_emb])[0]
+        print(f"[visual_merger] res shape: {torch.from_numpy(res).shape}")
+
         return torch.from_numpy(res)
 
     def __call__(
@@ -1320,7 +1492,11 @@ class OVQwen2_5OmniThinkerForConditionalGeneration(GenerationMixin):
             # 1. Extract the input embeddings
             inputs_embeds = torch.from_numpy(self.embed_tokens(input_ids)[0])
         if input_ids is not None and input_ids.shape[1] != 1:  # Prefill stage
+            print(f"Prefill stage: inputs_embeds shape: {inputs_embeds.shape}")
+            if input_ids.shape[1] == 1:
+                print(f"KV-Cache decode stage")
             if input_features is not None:
+                print(f"[Audio enc]")
                 audio_feat_lengths, audio_output_lengths = self._get_feat_extract_output_lengths(
                     audio_feature_lengths if audio_feature_lengths is not None else feature_attention_mask.sum(-1)
                 )
@@ -1356,16 +1532,20 @@ class OVQwen2_5OmniThinkerForConditionalGeneration(GenerationMixin):
                 inputs_embeds = inputs_embeds.masked_scatter(audio_mask, audio_features)
 
             if pixel_values is not None:
+                print(f"[Vision enc]")
                 image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
                 image_mask = (input_ids == self.config.image_token_index).unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
                 image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
                 inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+                print(f"After visual: inputs_embeds shape: {inputs_embeds.shape}")
 
             if pixel_values_videos is not None:
+                print(f"[Vision enc 2]")
                 video_embeds = self.visual(pixel_values_videos, grid_thw=video_grid_thw)
                 video_mask = (input_ids == self.config.video_token_index).unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
                 video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
                 inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+                print(f"After visual: inputs_embeds shape: {inputs_embeds.shape}")
 
             if attention_mask is not None:
                 attention_mask = attention_mask.to(inputs_embeds.device)
@@ -1374,10 +1554,14 @@ class OVQwen2_5OmniThinkerForConditionalGeneration(GenerationMixin):
             self.request.reset_state()
             self.next_beam_idx = np.arange(inputs_embeds.shape[0], dtype=int)
             self._past_length = 0
+
         inputs = {}
         inputs["inputs_embeds"] = inputs_embeds
         inputs["attention_mask"] = attention_mask
         inputs["position_ids"] = position_ids
+        # print(f"inputs_embeds shape {inputs_embeds.shape}")
+        # print(f"attention_mask shape {attention_mask.shape}")
+        # print(f"position_ids shape {position_ids.shape}")
         if "beam_idx" in self.input_names:
             inputs["beam_idx"] = self.next_beam_idx if self.next_beam_idx is not None else np.arange(inputs_embeds.shape[0], dtype=int)
         self.request.start_async(inputs, share_inputs=True)
@@ -1427,7 +1611,6 @@ class OVQwen2_5OmniThinkerForConditionalGeneration(GenerationMixin):
             model_kwargs["rope_deltas"] = outputs.rope_deltas
 
         return model_kwargs
-
 
 class OVQwen2_5OmniTalkerForConditionalGeneration(GenerationMixin):
     def __init__(self, model_dir, device, config):
