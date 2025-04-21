@@ -1,5 +1,6 @@
 import io
 from pathlib import Path
+import time
 import types
 import gc
 
@@ -1078,7 +1079,7 @@ def update_npu_config(config, model, kv_pos, kv_desc):
     update_config(config, ("NPUW_LLM_MAX_PROMPT_LEN", kv_desc.max_prompt_len))
     update_config(config, ("NPUW_LLM_MIN_RESPONSE_LEN", kv_desc.min_response_len))
 
-    # update_config(config, ("NPUW_DUMP_SUBS", "YES"))
+    update_config(config, ("NPUW_DUMP_SUBS", "YES"))
     update_config(config, ("NPU_COMPILER_DYNAMIC_QUANTIZATION", "YES"))
 
     rename_key(config, "++PREFILL_CONFIG", "++NPUW_LLM_PREFILL_CONFIG")
@@ -1139,6 +1140,20 @@ def npu_model_import_or_compile(blob_path, model_path, convert_func, device, mod
 class OVQwen2_5OmniThinkerForConditionalGeneration(GenerationMixin):
     def __init__(self, model_dir, device, config):
         self.model = core.read_model(model_dir / "openvino_thinker_language_model.xml")
+        self.input_names = {key.get_any_name(): idx for idx, key in enumerate(self.model.inputs)}
+        self.output_names = {key.get_any_name(): idx for idx, key in enumerate(self.model.outputs)}
+
+        print(f"Start to compile llm model on NPU")
+        kv_desc = KVDesc(max_prompt_len=1024, min_response_len=128)
+        kv_pos = KVAxesPosition(batch=0, seq_len=2)
+        ov_config = {}
+        update_npu_config(ov_config, self.model, kv_pos, kv_desc)
+        start = time.perf_counter()
+        compiled_model = core.compile_model(self.model, "NPU", ov_config)
+        self.llm_compilation_time = time.perf_counter() - start
+
+        # compiled_model = core.compile_model(self.model, device)
+        
         self.audio = core.compile_model(model_dir / "openvino_thinker_audio_model.xml", "CPU")
         self.audio_state = core.compile_model(model_dir / "openvino_thinker_audio_state_model.xml", "CPU")
         self.visual_patcher = core.compile_model(model_dir / "openvino_thinker_patcher_model.xml", "CPU")
@@ -1149,9 +1164,7 @@ class OVQwen2_5OmniThinkerForConditionalGeneration(GenerationMixin):
         self.visual_merger = core.compile_model(model_dir / "openvino_thinker_merger_model.xml", "GPU")
 
         self.embed_tokens = core.compile_model(model_dir / "openvino_thinker_embedding_model.xml", "CPU")
-        self.input_names = {key.get_any_name(): idx for idx, key in enumerate(self.model.inputs)}
-        self.output_names = {key.get_any_name(): idx for idx, key in enumerate(self.model.outputs)}
-        compiled_model = core.compile_model(self.model, device)
+
         self.request = compiled_model.create_infer_request()
         self.main_input_name = "input_ids"
         self.config = config.thinker_config
@@ -1559,9 +1572,10 @@ class OVQwen2_5OmniThinkerForConditionalGeneration(GenerationMixin):
         inputs["inputs_embeds"] = inputs_embeds
         inputs["attention_mask"] = attention_mask
         inputs["position_ids"] = position_ids
-        # print(f"inputs_embeds shape {inputs_embeds.shape}")
-        # print(f"attention_mask shape {attention_mask.shape}")
-        # print(f"position_ids shape {position_ids.shape}")
+
+        print(f"inputs_embeds shape {inputs_embeds.shape}")
+        print(f"attention_mask shape {attention_mask.shape}")
+        print(f"position_ids shape {position_ids.shape}")
         if "beam_idx" in self.input_names:
             inputs["beam_idx"] = self.next_beam_idx if self.next_beam_idx is not None else np.arange(inputs_embeds.shape[0], dtype=int)
         self.request.start_async(inputs, share_inputs=True)
