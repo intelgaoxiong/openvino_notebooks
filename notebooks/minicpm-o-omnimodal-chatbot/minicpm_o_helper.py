@@ -1910,15 +1910,13 @@ def npu_model_import_or_compile(blob_path, model_path, convert_func, device, mod
             raise Exception(f"{model_type.capitalize()} blob file can't be opened")
     else:
         model = core.read_model(model_path)
+        ir_name = model_type + "_static.xml"
         if model_type == 'vision_encoder' and config:
             model = convert_func(model, config.vision_config.patch_size)
-            ir_name = model_type + "_static.xml"
-        elif model_type == 'audio':
+        elif model_type == 'audio_encoder':
             model = convert_func(model)
-            ir_name = model_type + "_static.xml"
         elif model_type == 'resampler':
             model = convert_func(model)
-            ir_name = model_type + "_static.xml"
         else:
             print(f"Unsupported {model_type}")
             assert(1)
